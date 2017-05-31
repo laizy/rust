@@ -8,8 +8,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-// no-pretty-expanded unnecessary unsafe block generated
-
 #![deny(warnings)]
 #![allow(unused_must_use)]
 #![allow(unused_features)]
@@ -162,6 +160,34 @@ pub fn main() {
     t!(format!("{:?}", -0.0), "-0");
     t!(format!("{:?}", 0.0), "0");
 
+    // sign aware zero padding
+    t!(format!("{:<3}", 1), "1  ");
+    t!(format!("{:>3}", 1), "  1");
+    t!(format!("{:^3}", 1), " 1 ");
+    t!(format!("{:03}", 1), "001");
+    t!(format!("{:<03}", 1), "001");
+    t!(format!("{:>03}", 1), "001");
+    t!(format!("{:^03}", 1), "001");
+    t!(format!("{:+03}", 1), "+01");
+    t!(format!("{:<+03}", 1), "+01");
+    t!(format!("{:>+03}", 1), "+01");
+    t!(format!("{:^+03}", 1), "+01");
+    t!(format!("{:#05x}", 1), "0x001");
+    t!(format!("{:<#05x}", 1), "0x001");
+    t!(format!("{:>#05x}", 1), "0x001");
+    t!(format!("{:^#05x}", 1), "0x001");
+    t!(format!("{:05}", 1.2), "001.2");
+    t!(format!("{:<05}", 1.2), "001.2");
+    t!(format!("{:>05}", 1.2), "001.2");
+    t!(format!("{:^05}", 1.2), "001.2");
+    t!(format!("{:05}", -1.2), "-01.2");
+    t!(format!("{:<05}", -1.2), "-01.2");
+    t!(format!("{:>05}", -1.2), "-01.2");
+    t!(format!("{:^05}", -1.2), "-01.2");
+    t!(format!("{:+05}", 1.2), "+01.2");
+    t!(format!("{:<+05}", 1.2), "+01.2");
+    t!(format!("{:>+05}", 1.2), "+01.2");
+    t!(format!("{:^+05}", 1.2), "+01.2");
 
     // Ergonomic format_args!
     t!(format!("{0:x} {0:X}", 15), "f F");
@@ -239,7 +265,7 @@ fn test_write() {
 // can do with them just yet (to test the output)
 fn test_print() {
     print!("hi");
-    print!("{:?}", vec!(0u8));
+    print!("{:?}", vec![0u8]);
     println!("hello");
     println!("this is a {}", "test");
     println!("{foo}", foo="bar");

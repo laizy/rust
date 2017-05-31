@@ -13,15 +13,25 @@ crate-type = ["dylib", "rlib"]
 alloc = { path = "../liballoc" }
 alloc_jemalloc = { path = "../liballoc_jemalloc", optional = true }
 alloc_system = { path = "../liballoc_system" }
-panic_unwind = { path = "../libpanic_unwind" }
+panic_unwind = { path = "../libpanic_unwind", optional = true }
 panic_abort = { path = "../libpanic_abort" }
 collections = { path = "../libcollections" }
 core = { path = "../libcore" }
 libc = { path = "../rustc/libc_shim" }
 rand = { path = "../librand" }
 compiler_builtins = { path = "../libcompiler_builtins" }
-rustc_unicode = { path = "../librustc_unicode" }
+std_unicode = { path = "../libstd_unicode" }
 unwind = { path = "../libunwind" }
+
+[target.x86_64-apple-darwin.dependencies]
+rustc_asan = { path = "../librustc_asan" }
+rustc_tsan = { path = "../librustc_tsan" }
+
+[target.x86_64-unknown-linux-gnu.dependencies]
+rustc_asan = { path = "../librustc_asan" }
+rustc_lsan = { path = "../librustc_lsan" }
+rustc_msan = { path = "../librustc_msan" }
+rustc_tsan = { path = "../librustc_tsan" }
 
 [build-dependencies]
 build_helper = { path = "../build_helper" }
@@ -29,5 +39,7 @@ gcc = "0.3.27"
 
 [features]
 backtrace = []
-jemalloc = ["alloc_jemalloc"]
 debug-jemalloc = ["alloc_jemalloc/debug"]
+jemalloc = ["alloc_jemalloc"]
+force_alloc_system = []
+panic-unwind = ["panic_unwind"]

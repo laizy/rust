@@ -17,23 +17,25 @@ Rust MIR: a lowered representation of Rust. Also: an experiment!
 #![crate_name = "rustc_mir"]
 #![crate_type = "rlib"]
 #![crate_type = "dylib"]
-#![cfg_attr(not(stage0), deny(warnings))]
-#![unstable(feature = "rustc_private", issue = "27812")]
+#![deny(warnings)]
 
 #![feature(associated_consts)]
 #![feature(box_patterns)]
-#![feature(dotdot_in_tuple_patterns)]
+#![feature(box_syntax)]
+#![feature(i128_type)]
 #![feature(rustc_diagnostic_macros)]
-#![feature(rustc_private)]
-#![feature(staged_api)]
-#![cfg_attr(stage0, feature(question_mark))]
+#![feature(placement_in_syntax)]
+#![feature(collection_placement)]
+
+#![cfg_attr(stage0, unstable(feature = "rustc_private", issue = "27812"))]
+#![cfg_attr(stage0, feature(rustc_private))]
+#![cfg_attr(stage0, feature(staged_api))]
 
 #[macro_use] extern crate log;
 extern crate graphviz as dot;
 #[macro_use]
 extern crate rustc;
 extern crate rustc_data_structures;
-extern crate rustc_back;
 #[macro_use]
 #[no_link]
 extern crate rustc_bitflags;
@@ -45,11 +47,15 @@ extern crate rustc_const_eval;
 
 pub mod diagnostics;
 
-pub mod build;
-pub mod def_use;
-pub mod graphviz;
+mod build;
 mod hair;
-pub mod mir_map;
-pub mod pretty;
+mod shim;
 pub mod transform;
+pub mod util;
 
+use rustc::ty::maps::Providers;
+
+pub fn provide(providers: &mut Providers) {
+    shim::provide(providers);
+    transform::provide(providers);
+}

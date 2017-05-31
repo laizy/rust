@@ -48,7 +48,7 @@ pub fn push_debuginfo_type_name<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
             push_item_name(cx, def.did, qualified, output);
             push_type_params(cx, substs, output);
         },
-        ty::TyTuple(component_types) => {
+        ty::TyTuple(component_types, _) => {
             output.push('(');
             for &component_type in component_types {
                 push_debuginfo_type_name(cx, component_type, true, output);
@@ -59,11 +59,6 @@ pub fn push_debuginfo_type_name<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
                 output.pop();
             }
             output.push(')');
-        },
-        ty::TyBox(inner_type) => {
-            output.push_str("Box<");
-            push_debuginfo_type_name(cx, inner_type, true, output);
-            output.push('>');
         },
         ty::TyRawPtr(ty::TypeAndMut { ty: inner_type, mutbl } ) => {
             output.push('*');
@@ -93,18 +88,21 @@ pub fn push_debuginfo_type_name<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
             push_debuginfo_type_name(cx, inner_type, true, output);
             output.push(']');
         },
-        ty::TyTrait(ref trait_data) => {
-            let principal = cx.tcx().erase_late_bound_regions_and_normalize(
-                &trait_data.principal);
-            push_item_name(cx, principal.def_id, false, output);
-            push_type_params(cx, principal.substs, output);
+        ty::TyDynamic(ref trait_data, ..) => {
+            if let Some(principal) = trait_data.principal() {
+                let principal = cx.tcx().erase_late_bound_regions_and_normalize(
+                    &principal);
+                push_item_name(cx, principal.def_id, false, output);
+                push_type_params(cx, principal.substs, output);
+            }
         },
-        ty::TyFnDef(.., &ty::BareFnTy{ unsafety, abi, ref sig } ) |
-        ty::TyFnPtr(&ty::BareFnTy{ unsafety, abi, ref sig } ) => {
-            if unsafety == hir::Unsafety::Unsafe {
+        ty::TyFnDef(.., sig) |
+        ty::TyFnPtr(sig) => {
+            if sig.unsafety() == hir::Unsafety::Unsafe {
                 output.push_str("unsafe ");
             }
 
+            let abi = sig.abi();
             if abi != ::abi::Abi::Rust {
                 output.push_str("extern \"");
                 output.push_str(abi.name());
@@ -113,9 +111,9 @@ pub fn push_debuginfo_type_name<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
 
             output.push_str("fn(");
 
-            let sig = cx.tcx().erase_late_bound_regions_and_normalize(sig);
-            if !sig.inputs.is_empty() {
-                for &parameter_type in &sig.inputs {
+            let sig = cx.tcx().erase_late_bound_regions_and_normalize(&sig);
+            if !sig.inputs().is_empty() {
+                for &parameter_type in sig.inputs() {
                     push_debuginfo_type_name(cx, parameter_type, true, output);
                     output.push_str(", ");
                 }
@@ -124,7 +122,7 @@ pub fn push_debuginfo_type_name<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
             }
 
             if sig.variadic {
-                if !sig.inputs.is_empty() {
+                if !sig.inputs().is_empty() {
                     output.push_str(", ...");
                 } else {
                     output.push_str("...");
@@ -133,9 +131,9 @@ pub fn push_debuginfo_type_name<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
 
             output.push(')');
 
-            if !sig.output.is_nil() {
+            if !sig.output().is_nil() {
                 output.push_str(" -> ");
-                push_debuginfo_type_name(cx, sig.output, true, output);
+                push_debuginfo_type_name(cx, sig.output(), true, output);
             }
         },
         ty::TyClosure(..) => {
@@ -156,7 +154,7 @@ pub fn push_debuginfo_type_name<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
                       qualified: bool,
                       output: &mut String) {
         if qualified {
-            output.push_str(&cx.tcx().crate_name(def_id.krate));
+            output.push_str(&cx.tcx().crate_name(def_id.krate).as_str());
             for path_element in cx.tcx().def_path(def_id).data {
                 output.push_str("::");
                 output.push_str(&path_element.data.as_interned_str());

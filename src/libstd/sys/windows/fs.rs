@@ -58,7 +58,7 @@ pub struct DirEntry {
     data: c::WIN32_FIND_DATAW,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OpenOptions {
     // generic
     read: bool,
@@ -79,7 +79,16 @@ pub struct OpenOptions {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FilePermissions { attrs: c::DWORD }
 
+#[derive(Debug)]
 pub struct DirBuilder;
+
+impl fmt::Debug for ReadDir {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // This will only be called from std::fs::ReadDir, which will add a "ReadDir()" frame.
+        // Thus the result will be e g 'ReadDir("C:\")'
+        fmt::Debug::fmt(&*self.root, f)
+    }
+}
 
 impl Iterator for ReadDir {
     type Item = io::Result<DirEntry>;
@@ -409,6 +418,24 @@ impl File {
             Ok(PathBuf::from(OsString::from_wide(subst)))
         }
     }
+
+    pub fn set_permissions(&self, perm: FilePermissions) -> io::Result<()> {
+        let mut info = c::FILE_BASIC_INFO {
+            CreationTime: 0,
+            LastAccessTime: 0,
+            LastWriteTime: 0,
+            ChangeTime: 0,
+            FileAttributes: perm.attrs,
+        };
+        let size = mem::size_of_val(&info);
+        cvt(unsafe {
+            c::SetFileInformationByHandle(self.handle.raw(),
+                                          c::FileBasicInfo,
+                                          &mut info as *mut _ as *mut _,
+                                          size as c::DWORD)
+        })?;
+        Ok(())
+    }
 }
 
 impl FromInner<c::HANDLE> for File {
@@ -619,9 +646,25 @@ pub fn symlink_inner(src: &Path, dst: &Path, dir: bool) -> io::Result<()> {
     let src = to_u16s(src)?;
     let dst = to_u16s(dst)?;
     let flags = if dir { c::SYMBOLIC_LINK_FLAG_DIRECTORY } else { 0 };
-    cvt(unsafe {
-        c::CreateSymbolicLinkW(dst.as_ptr(), src.as_ptr(), flags) as c::BOOL
-    })?;
+    // Formerly, symlink creation required the SeCreateSymbolicLink privilege. For the Windows 10
+    // Creators Update, Microsoft loosened this to allow unprivileged symlink creation if the
+    // computer is in Developer Mode, but SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE must be
+    // added to dwFlags to opt into this behaviour.
+    let result = cvt(unsafe {
+        c::CreateSymbolicLinkW(dst.as_ptr(), src.as_ptr(),
+                               flags | c::SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) as c::BOOL
+    });
+    if let Err(err) = result {
+        if err.raw_os_error() == Some(c::ERROR_INVALID_PARAMETER as i32) {
+            // Older Windows objects to SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+            // so if we encounter ERROR_INVALID_PARAMETER, retry without that flag.
+            cvt(unsafe {
+                c::CreateSymbolicLinkW(dst.as_ptr(), src.as_ptr(), flags) as c::BOOL
+            })?;
+        } else {
+            return Err(err);
+        }
+    }
     Ok(())
 }
 

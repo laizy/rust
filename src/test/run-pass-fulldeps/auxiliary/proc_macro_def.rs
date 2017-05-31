@@ -9,48 +9,46 @@
 // except according to those terms.
 
 #![feature(plugin, plugin_registrar, rustc_private)]
+#![plugin(proc_macro_plugin)]
 
-extern crate proc_macro_plugin;
 extern crate rustc_plugin;
 extern crate syntax;
 
-use proc_macro_plugin::prelude::*;
 use rustc_plugin::Registry;
 use syntax::ext::base::SyntaxExtension;
-use syntax::ext::proc_macro_shim::prelude::*;
+use syntax::tokenstream::TokenStream;
+use syntax::symbol::Symbol;
 
 #[plugin_registrar]
 pub fn plugin_registrar(reg: &mut Registry) {
-    reg.register_syntax_extension(token::intern("attr_tru"),
+    reg.register_syntax_extension(Symbol::intern("attr_tru"),
                                   SyntaxExtension::AttrProcMacro(Box::new(attr_tru)));
-    reg.register_syntax_extension(token::intern("attr_identity"),
+    reg.register_syntax_extension(Symbol::intern("attr_identity"),
                                   SyntaxExtension::AttrProcMacro(Box::new(attr_identity)));
-    reg.register_syntax_extension(token::intern("tru"),
+    reg.register_syntax_extension(Symbol::intern("tru"),
                                   SyntaxExtension::ProcMacro(Box::new(tru)));
-    reg.register_syntax_extension(token::intern("ret_tru"),
+    reg.register_syntax_extension(Symbol::intern("ret_tru"),
                                   SyntaxExtension::ProcMacro(Box::new(ret_tru)));
-    reg.register_syntax_extension(token::intern("identity"),
+    reg.register_syntax_extension(Symbol::intern("identity"),
                                   SyntaxExtension::ProcMacro(Box::new(identity)));
 }
 
 fn attr_tru(_attr: TokenStream, _item: TokenStream) -> TokenStream {
-    lex("fn f1() -> bool { true }")
+    quote!(fn f1() -> bool { true })
 }
 
 fn attr_identity(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let source = item.to_string();
-    lex(&source)
+    quote!($item)
 }
 
 fn tru(_ts: TokenStream) -> TokenStream {
-    lex("true")
+    quote!(true)
 }
 
 fn ret_tru(_ts: TokenStream) -> TokenStream {
-    lex("return true;")
+    quote!(return true;)
 }
 
 fn identity(ts: TokenStream) -> TokenStream {
-    let source = ts.to_string();
-    lex(&source)
+    quote!($ts)
 }

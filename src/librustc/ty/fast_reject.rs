@@ -59,8 +59,8 @@ pub fn simplify_type<'a, 'gcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'tcx>,
         ty::TyStr => Some(StrSimplifiedType),
         ty::TyArray(..) | ty::TySlice(_) => Some(ArraySimplifiedType),
         ty::TyRawPtr(_) => Some(PtrSimplifiedType),
-        ty::TyTrait(ref trait_info) => {
-            Some(TraitSimplifiedType(trait_info.principal.def_id()))
+        ty::TyDynamic(ref trait_info, ..) => {
+            trait_info.principal().map(|p| TraitSimplifiedType(p.def_id()))
         }
         ty::TyRef(_, mt) => {
             // since we introduce auto-refs during method lookup, we
@@ -68,22 +68,15 @@ pub fn simplify_type<'a, 'gcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'tcx>,
             // view of possibly unifying
             simplify_type(tcx, mt.ty, can_simplify_params)
         }
-        ty::TyBox(_) => {
-            // treat like we would treat `Box`
-            match tcx.lang_items.require_owned_box() {
-                Ok(def_id) => Some(AdtSimplifiedType(def_id)),
-                Err(msg) => tcx.sess.fatal(&msg),
-            }
-        }
         ty::TyClosure(def_id, _) => {
             Some(ClosureSimplifiedType(def_id))
         }
         ty::TyNever => Some(NeverSimplifiedType),
-        ty::TyTuple(ref tys) => {
+        ty::TyTuple(ref tys, _) => {
             Some(TupleSimplifiedType(tys.len()))
         }
         ty::TyFnDef(.., ref f) | ty::TyFnPtr(ref f) => {
-            Some(FunctionSimplifiedType(f.sig.0.inputs.len()))
+            Some(FunctionSimplifiedType(f.skip_binder().inputs().len()))
         }
         ty::TyProjection(_) | ty::TyParam(_) => {
             if can_simplify_params {

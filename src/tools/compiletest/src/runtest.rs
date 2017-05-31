@@ -12,25 +12,26 @@ use common::Config;
 use common::{CompileFail, ParseFail, Pretty, RunFail, RunPass, RunPassValgrind};
 use common::{Codegen, DebugInfoLldb, DebugInfoGdb, Rustdoc, CodegenUnits};
 use common::{Incremental, RunMake, Ui, MirOpt};
+use diff;
 use errors::{self, ErrorKind, Error};
+use filetime::FileTime;
 use json;
 use header::TestProps;
-use header;
 use procsrv;
 use test::TestPaths;
-use uidiff;
 use util::logv;
 
-use std::env;
 use std::collections::HashSet;
-use std::fmt;
-use std::fs::{self, File};
-use std::io::{self, BufReader};
+use std::env;
+use std::fs::{self, File, create_dir_all};
 use std::io::prelude::*;
-use std::net::TcpStream;
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, ExitStatus};
 use std::str;
+use std::collections::HashMap;
+
+use extract_gdb_version;
 
 pub fn run(config: Config, testpaths: &TestPaths) {
     match &*config.target {
@@ -41,7 +42,12 @@ pub fn run(config: Config, testpaths: &TestPaths) {
             }
         }
 
-        _=> { }
+        _ => {
+            // android has its own gdb handling
+            if config.mode == DebugInfoGdb && config.gdb.is_none() {
+                panic!("gdb not available but debuginfo gdb debuginfo test requested");
+            }
+        }
     }
 
     if config.verbose {
@@ -49,7 +55,7 @@ pub fn run(config: Config, testpaths: &TestPaths) {
         print!("\n\n");
     }
     debug!("running {:?}", testpaths.file.display());
-    let base_props = TestProps::from_file(&testpaths.file);
+    let base_props = TestProps::from_file(&testpaths.file, &config);
 
     let base_cx = TestCx { config: &config,
                            props: &base_props,
@@ -62,7 +68,7 @@ pub fn run(config: Config, testpaths: &TestPaths) {
     } else {
         for revision in &base_props.revisions {
             let mut revision_props = base_props.clone();
-            revision_props.load_from(&testpaths.file, Some(&revision));
+            revision_props.load_from(&testpaths.file, Some(&revision), &config);
             let rev_cx = TestCx {
                 config: &config,
                 props: &revision_props,
@@ -74,6 +80,8 @@ pub fn run(config: Config, testpaths: &TestPaths) {
     }
 
     base_cx.complete_all();
+
+    File::create(::stamp(&config, &testpaths)).unwrap();
 }
 
 struct TestCx<'test> {
@@ -253,7 +261,7 @@ impl<'test> TestCx<'test> {
 
         let mut src = String::new();
         File::open(&self.testpaths.file).unwrap().read_to_string(&mut src).unwrap();
-        let mut srcs = vec!(src);
+        let mut srcs = vec![src];
 
         let mut round = 0;
         while round < rounds {
@@ -335,13 +343,13 @@ impl<'test> TestCx<'test> {
                     -> ProcArgs {
         let aux_dir = self.aux_output_dir_name();
         // FIXME (#9639): This needs to handle non-utf8 paths
-        let mut args = vec!("-".to_owned(),
+        let mut args = vec!["-".to_owned(),
                             "-Zunstable-options".to_owned(),
                             "--unpretty".to_owned(),
                             pretty_type,
                             format!("--target={}", self.config.target),
                             "-L".to_owned(),
-                            aux_dir.to_str().unwrap().to_owned());
+                            aux_dir.to_str().unwrap().to_owned()];
         args.extend(self.split_maybe_args(&self.config.target_rustcflags));
         args.extend(self.props.compile_flags.iter().cloned());
         return ProcArgs {
@@ -385,10 +393,10 @@ actual:\n\
 
         let out_dir = self.output_base_name().with_extension("pretty-out");
         let _ = fs::remove_dir_all(&out_dir);
-        self.create_dir_racy(&out_dir);
+        create_dir_all(&out_dir).unwrap();
 
         // FIXME (#9639): This needs to handle non-utf8 paths
-        let mut args = vec!("-".to_owned(),
+        let mut args = vec!["-".to_owned(),
                             "-Zno-trans".to_owned(),
                             "--out-dir".to_owned(),
                             out_dir.to_str().unwrap().to_owned(),
@@ -396,7 +404,7 @@ actual:\n\
                             "-L".to_owned(),
                             self.config.build_base.to_str().unwrap().to_owned(),
                             "-L".to_owned(),
-                            aux_dir.to_str().unwrap().to_owned());
+                            aux_dir.to_str().unwrap().to_owned()];
         if let Some(revision) = self.revision {
             args.extend(vec![
                 format!("--cfg"),
@@ -430,11 +438,23 @@ actual:\n\
     }
 
     fn run_debuginfo_gdb_test_no_opt(&self) {
+        let prefixes = if self.config.gdb_native_rust {
+            // GDB with Rust
+            static PREFIXES: &'static [&'static str] = &["gdb", "gdbr"];
+            println!("NOTE: compiletest thinks it is using GDB with native rust support");
+            PREFIXES
+        } else {
+            // Generic GDB
+            static PREFIXES: &'static [&'static str] = &["gdb", "gdbg"];
+            println!("NOTE: compiletest thinks it is using GDB without native rust support");
+            PREFIXES
+        };
+
         let DebuggerCommands {
             commands,
             check_lines,
             breakpoint_lines
-        } = self.parse_debugger_commands("gdb");
+        } = self.parse_debugger_commands(prefixes);
         let mut cmds = commands.join("\n");
 
         // compile test file (it should have 'compile-flags:-g' in the header)
@@ -447,7 +467,9 @@ actual:\n\
 
         let debugger_run_result;
         match &*self.config.target {
-            "arm-linux-androideabi" | "armv7-linux-androideabi" | "aarch64-linux-android" => {
+            "arm-linux-androideabi" |
+            "armv7-linux-androideabi" |
+            "aarch64-linux-android" => {
 
                 cmds = cmds.replace("run", "continue");
 
@@ -487,8 +509,8 @@ actual:\n\
                                  exe_file.to_str().unwrap().to_owned(),
                                  self.config.adb_test_dir.clone()
                              ],
-                             vec!(("".to_owned(), "".to_owned())),
-                             Some("".to_owned()))
+                             Vec::new(),
+                             None)
                     .expect(&format!("failed to exec `{:?}`", self.config.adb_path));
 
                 procsrv::run("",
@@ -499,8 +521,8 @@ actual:\n\
                                  "tcp:5039".to_owned(),
                                  "tcp:5039".to_owned()
                              ],
-                             vec!(("".to_owned(), "".to_owned())),
-                             Some("".to_owned()))
+                             Vec::new(),
+                             None)
                     .expect(&format!("failed to exec `{:?}`", self.config.adb_path));
 
                 let adb_arg = format!("export LD_LIBRARY_PATH={}; \
@@ -512,6 +534,7 @@ actual:\n\
                                       exe_file.file_name().unwrap().to_str()
                                       .unwrap());
 
+                debug!("adb arg: {}", adb_arg);
                 let mut process = procsrv::run_background("",
                                                           &self.config.adb_path
                                                           ,
@@ -520,28 +543,34 @@ actual:\n\
                                                               "shell".to_owned(),
                                                               adb_arg.clone()
                                                           ],
-                                                          vec!(("".to_owned(),
-                                                                "".to_owned())),
-                                                          Some("".to_owned()))
+                                                          Vec::new(),
+                                                          None)
                     .expect(&format!("failed to exec `{:?}`", self.config.adb_path));
+
+                // Wait for the gdbserver to print out "Listening on port ..."
+                // at which point we know that it's started and then we can
+                // execute the debugger below.
+                let mut stdout = BufReader::new(process.stdout.take().unwrap());
+                let mut line = String::new();
                 loop {
-                    //waiting 1 second for gdbserver start
-                    ::std::thread::sleep(::std::time::Duration::new(1,0));
-                    if TcpStream::connect("127.0.0.1:5039").is_ok() {
+                    line.truncate(0);
+                    stdout.read_line(&mut line).unwrap();
+                    if line.starts_with("Listening on port 5039") {
                         break
                     }
                 }
+                drop(stdout);
 
                 let debugger_script = self.make_out_name("debugger.script");
                 // FIXME (#9639): This needs to handle non-utf8 paths
                 let debugger_opts =
-                    vec!("-quiet".to_owned(),
+                    vec!["-quiet".to_owned(),
                          "-batch".to_owned(),
                          "-nx".to_owned(),
-                         format!("-command={}", debugger_script.to_str().unwrap()));
+                         format!("-command={}", debugger_script.to_str().unwrap())];
 
                 let mut gdb_path = tool_path;
-                gdb_path.push_str(&format!("/bin/{}-gdb", self.config.target));
+                gdb_path.push_str("/bin/gdb");
                 let procsrv::Result {
                     out,
                     err,
@@ -550,7 +579,7 @@ actual:\n\
                                  &gdb_path,
                                  None,
                                  &debugger_opts,
-                                 vec!(("".to_owned(), "".to_owned())),
+                                 Vec::new(),
                                  None)
                     .expect(&format!("failed to exec `{:?}`", gdb_path));
                 let cmdline = {
@@ -562,7 +591,7 @@ actual:\n\
                 };
 
                 debugger_run_result = ProcRes {
-                    status: Status::Normal(status),
+                    status: status,
                     stdout: out,
                     stderr: err,
                     cmdline: cmdline
@@ -586,19 +615,18 @@ actual:\n\
                 script_str.push_str("show version\n");
 
                 match self.config.gdb_version {
-                    Some(ref version) => {
+                    Some(version) => {
                         println!("NOTE: compiletest thinks it is using GDB version {}",
                                  version);
 
-                        if header::gdb_version_to_int(version) >
-                            header::gdb_version_to_int("7.4") {
-                                // Add the directory containing the pretty printers to
-                                // GDB's script auto loading safe path
-                                script_str.push_str(
-                                    &format!("add-auto-load-safe-path {}\n",
-                                             rust_pp_module_abs_path.replace(r"\", r"\\"))
-                                );
-                            }
+                        if version > extract_gdb_version("7.4").unwrap() {
+                            // Add the directory containing the pretty printers to
+                            // GDB's script auto loading safe path
+                            script_str.push_str(
+                                &format!("add-auto-load-safe-path {}\n",
+                                         rust_pp_module_abs_path.replace(r"\", r"\\"))
+                            );
+                        }
                     }
                     _ => {
                         println!("NOTE: compiletest does not know which version of \
@@ -619,6 +647,11 @@ actual:\n\
                                              exe_file.to_str().unwrap()
                                              .replace(r"\", r"\\")));
 
+                // Force GDB to print values in the Rust format.
+                if self.config.gdb_native_rust {
+                    script_str.push_str("set language rust\n");
+                }
+
                 // Add line breakpoints
                 for line in &breakpoint_lines {
                     script_str.push_str(&format!("break '{}':{}\n",
@@ -633,22 +666,17 @@ actual:\n\
                 debug!("script_str = {}", script_str);
                 self.dump_output_file(&script_str, "debugger.script");
 
-                // run debugger script with gdb
-                fn debugger() -> &'static str {
-                    if cfg!(windows) {"gdb.exe"} else {"gdb"}
-                }
-
                 let debugger_script = self.make_out_name("debugger.script");
 
                 // FIXME (#9639): This needs to handle non-utf8 paths
                 let debugger_opts =
-                    vec!("-quiet".to_owned(),
+                    vec!["-quiet".to_owned(),
                          "-batch".to_owned(),
                          "-nx".to_owned(),
-                         format!("-command={}", debugger_script.to_str().unwrap()));
+                         format!("-command={}", debugger_script.to_str().unwrap())];
 
                 let proc_args = ProcArgs {
-                    prog: debugger().to_owned(),
+                    prog: self.config.gdb.as_ref().unwrap().to_owned(),
                     args: debugger_opts,
                 };
 
@@ -731,7 +759,7 @@ actual:\n\
             check_lines,
             breakpoint_lines,
             ..
-        } = self.parse_debugger_commands("lldb");
+        } = self.parse_debugger_commands(&["lldb"]);
 
         // Write debugger script:
         // We don't want to hang when calling `quit` while the process is still running
@@ -819,20 +847,22 @@ actual:\n\
 
         self.dump_output(&out, &err);
         ProcRes {
-            status: Status::Normal(status),
+            status: status,
             stdout: out,
             stderr: err,
             cmdline: format!("{:?}", cmd)
         }
     }
 
-    fn parse_debugger_commands(&self, debugger_prefix: &str) -> DebuggerCommands {
-        let command_directive = format!("{}-command", debugger_prefix);
-        let check_directive = format!("{}-check", debugger_prefix);
+    fn parse_debugger_commands(&self, debugger_prefixes: &[&str]) -> DebuggerCommands {
+        let directives = debugger_prefixes.iter().map(|prefix| (
+            format!("{}-command", prefix),
+            format!("{}-check", prefix),
+        )).collect::<Vec<_>>();
 
-        let mut breakpoint_lines = vec!();
-        let mut commands = vec!();
-        let mut check_lines = vec!();
+        let mut breakpoint_lines = vec![];
+        let mut commands = vec![];
+        let mut check_lines = vec![];
         let mut counter = 1;
         let reader = BufReader::new(File::open(&self.testpaths.file).unwrap());
         for line in reader.lines() {
@@ -842,17 +872,19 @@ actual:\n\
                         breakpoint_lines.push(counter);
                     }
 
-                    header::parse_name_value_directive(
-                        &line,
-                        &command_directive).map(|cmd| {
-                            commands.push(cmd)
-                        });
+                    for &(ref command_directive, ref check_directive) in &directives {
+                        self.config.parse_name_value_directive(
+                            &line,
+                            &command_directive).map(|cmd| {
+                                commands.push(cmd)
+                            });
 
-                    header::parse_name_value_directive(
-                        &line,
-                        &check_directive).map(|cmd| {
-                            check_lines.push(cmd)
-                        });
+                        self.config.parse_name_value_directive(
+                            &line,
+                            &check_directive).map(|cmd| {
+                                check_lines.push(cmd)
+                            });
+                    }
                 }
                 Err(e) => {
                     self.fatal(&format!("Error while parsing debugger commands: {}", e))
@@ -1120,8 +1152,8 @@ actual:\n\
     fn compile_test(&self) -> ProcRes {
         let aux_dir = self.aux_output_dir_name();
         // FIXME (#9639): This needs to handle non-utf8 paths
-        let link_args = vec!("-L".to_owned(),
-                             aux_dir.to_str().unwrap().to_owned());
+        let link_args = vec!["-L".to_owned(),
+                             aux_dir.to_str().unwrap().to_owned()];
         let args = self.make_compile_args(link_args,
                                           &self.testpaths.file,
                                           TargetLocation::ThisFile(self.make_exe_name()));
@@ -1132,7 +1164,9 @@ actual:\n\
         if self.props.build_aux_docs {
             for rel_ab in &self.props.aux_builds {
                 let aux_testpaths = self.compute_aux_test_paths(rel_ab);
-                let aux_props = self.props.from_aux_file(&aux_testpaths.file, self.revision);
+                let aux_props = self.props.from_aux_file(&aux_testpaths.file,
+                                                         self.revision,
+                                                         self.config);
                 let aux_cx = TestCx {
                     config: self.config,
                     props: &aux_props,
@@ -1164,11 +1198,44 @@ actual:\n\
         let env = self.props.exec_env.clone();
 
         match &*self.config.target {
-
-            "arm-linux-androideabi" | "armv7-linux-androideabi" | "aarch64-linux-android" => {
-                self._arm_exec_compiled_test(env)
+            // This is pretty similar to below, we're transforming:
+            //
+            //      program arg1 arg2
+            //
+            // into
+            //
+            //      remote-test-client run program:support-lib.so arg1 arg2
+            //
+            // The test-client program will upload `program` to the emulator
+            // along with all other support libraries listed (in this case
+            // `support-lib.so`. It will then execute the program on the
+            // emulator with the arguments specified (in the environment we give
+            // the process) and then report back the same result.
+            _ if self.config.remote_test_client.is_some() => {
+                let aux_dir = self.aux_output_dir_name();
+                let mut args = self.make_run_args();
+                let mut program = args.prog.clone();
+                if let Ok(entries) = aux_dir.read_dir() {
+                    for entry in entries {
+                        let entry = entry.unwrap();
+                        if !entry.path().is_file() {
+                            continue
+                        }
+                        program.push_str(":");
+                        program.push_str(entry.path().to_str().unwrap());
+                    }
+                }
+                args.args.insert(0, program);
+                args.args.insert(0, "run".to_string());
+                args.prog = self.config.remote_test_client.clone().unwrap()
+                                .into_os_string().into_string().unwrap();
+                self.compose_and_run(args,
+                                     env,
+                                     self.config.run_lib_path.to_str().unwrap(),
+                                     Some(aux_dir.to_str().unwrap()),
+                                     None)
             }
-            _=> {
+            _ => {
                 let aux_dir = self.aux_output_dir_name();
                 self.compose_and_run(self.make_run_args(),
                                      env,
@@ -1205,7 +1272,7 @@ actual:\n\
 
     fn compose_and_run_compiler(&self, args: ProcArgs, input: Option<String>) -> ProcRes {
         if !self.props.aux_builds.is_empty() {
-            self.create_dir_racy(&self.aux_output_dir_name());
+            create_dir_all(&self.aux_output_dir_name()).unwrap();
         }
 
         let aux_dir = self.aux_output_dir_name();
@@ -1215,7 +1282,9 @@ actual:\n\
 
         for rel_ab in &self.props.aux_builds {
             let aux_testpaths = self.compute_aux_test_paths(rel_ab);
-            let aux_props = self.props.from_aux_file(&aux_testpaths.file, self.revision);
+            let aux_props = self.props.from_aux_file(&aux_testpaths.file,
+                                                     self.revision,
+                                                     self.config);
             let mut crate_type = if aux_props.no_prefer_dynamic {
                 Vec::new()
             } else {
@@ -1231,9 +1300,9 @@ actual:\n\
                 if (self.config.target.contains("musl") && !aux_props.force_host) ||
                     self.config.target.contains("emscripten")
                 {
-                    vec!("--crate-type=lib".to_owned())
+                    vec!["--crate-type=lib".to_owned()]
                 } else {
-                    vec!("--crate-type=dylib".to_owned())
+                    vec!["--crate-type=dylib".to_owned()]
                 }
             };
             crate_type.extend(extra_link_args.clone());
@@ -1260,13 +1329,6 @@ actual:\n\
                              aux_testpaths.file.display()),
                     &auxres);
             }
-
-            match &*self.config.target {
-                "arm-linux-androideabi" | "armv7-linux-androideabi" | "aarch64-linux-android" => {
-                    self._arm_push_aux_shared_library();
-                }
-                _ => {}
-            }
         }
 
         self.compose_and_run(args,
@@ -1276,22 +1338,6 @@ actual:\n\
                              input)
     }
 
-    // Like std::fs::create_dir_all, except handles concurrent calls among multiple
-    // threads or processes.
-    fn create_dir_racy(&self, path: &Path) {
-        match fs::create_dir(path) {
-            Ok(()) => return,
-            Err(ref e) if e.kind() == io::ErrorKind::AlreadyExists => return,
-            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => panic!("failed to create dir {:?}: {}", path, e),
-        }
-        self.create_dir_racy(path.parent().unwrap());
-        match fs::create_dir(path) {
-            Ok(()) => {}
-            Err(ref e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => panic!("failed to create dir {:?}: {}", path, e),
-        }
-    }
 
     fn compose_and_run(&self,
                        ProcArgs{ args, prog }: ProcArgs,
@@ -1315,10 +1361,20 @@ actual:\n\
         };
 
         // FIXME (#9639): This needs to handle non-utf8 paths
-        let mut args = vec!(input_file.to_str().unwrap().to_owned(),
+        let mut args = vec![input_file.to_str().unwrap().to_owned(),
                             "-L".to_owned(),
-                            self.config.build_base.to_str().unwrap().to_owned(),
-                            format!("--target={}", target));
+                            self.config.build_base.to_str().unwrap().to_owned()];
+
+        // Optionally prevent default --target if specified in test compile-flags.
+        let custom_target = self.props.compile_flags
+            .iter()
+            .fold(false, |acc, ref x| acc || x.starts_with("--target"));
+
+        if !custom_target {
+            args.extend(vec![
+                format!("--target={}", target),
+            ]);
+        }
 
         if let Some(revision) = self.revision {
             args.extend(vec![
@@ -1351,18 +1407,16 @@ actual:\n\
                 }
             }
             MirOpt => {
-                args.extend(["-Z",
-                             "dump-mir=all",
-                             "-Z",
-                             "mir-opt-level=3",
-                             "-Z"]
+                args.extend(["-Zdump-mir=all",
+                             "-Zmir-opt-level=3",
+                             "-Zdump-mir-exclude-pass-number"]
                             .iter()
                             .map(|s| s.to_string()));
 
 
                 let mir_dump_dir = self.get_mir_dump_dir();
-                self.create_dir_racy(mir_dump_dir.as_path());
-                let mut dir_opt = "dump-mir-dir=".to_string();
+                create_dir_all(mir_dump_dir.as_path()).unwrap();
+                let mut dir_opt = "-Zdump-mir-dir=".to_string();
                 dir_opt.push_str(mir_dump_dir.to_str().unwrap());
                 debug!("dir_opt: {:?}", dir_opt);
 
@@ -1439,8 +1493,11 @@ actual:\n\
 
         // If this is emscripten, then run tests under nodejs
         if self.config.target.contains("emscripten") {
-            let nodejs = self.config.nodejs.clone().unwrap_or("nodejs".to_string());
-            args.push(nodejs);
+            if let Some(ref p) = self.config.nodejs {
+                args.push(p.clone());
+            } else {
+                self.fatal("no NodeJS binary found (--nodejs)");
+            }
         }
 
         let exe_file = self.make_exe_name();
@@ -1503,7 +1560,7 @@ actual:\n\
                          input).expect(&format!("failed to exec `{}`", prog));
         self.dump_output(&out, &err);
         return ProcRes {
-            status: Status::Normal(status),
+            status: status,
             stdout: out,
             stderr: err,
             cmdline: cmdline,
@@ -1528,8 +1585,14 @@ actual:\n\
     }
 
     fn dump_output(&self, out: &str, err: &str) {
-        self.dump_output_file(out, "out");
-        self.dump_output_file(err, "err");
+        let revision = if let Some(r) = self.revision {
+            format!("{}.", r)
+        } else {
+            String::new()
+        };
+
+        self.dump_output_file(out, &format!("{}out", revision));
+        self.dump_output_file(err, &format!("{}err", revision));
         self.maybe_dump_to_stdout(out, err);
     }
 
@@ -1589,159 +1652,46 @@ actual:\n\
     }
 
     fn fatal_proc_rec(&self, err: &str, proc_res: &ProcRes) -> ! {
+        self.try_print_open_handles();
         self.error(err);
         proc_res.fatal(None);
     }
 
-    fn _arm_exec_compiled_test(&self, env: Vec<(String, String)>) -> ProcRes {
-        let args = self.make_run_args();
-        let cmdline = self.make_cmdline("", &args.prog, &args.args);
-
-        // get bare program string
-        let mut tvec: Vec<String> = args.prog
-                                        .split('/')
-                                        .map(str::to_owned)
-                                        .collect();
-        let prog_short = tvec.pop().unwrap();
-
-        // copy to target
-        let copy_result = procsrv::run("",
-                                       &self.config.adb_path,
-                                       None,
-                                       &[
-                                           "push".to_owned(),
-                                           args.prog.clone(),
-                                           self.config.adb_test_dir.clone()
-                                       ],
-                                       vec!(("".to_owned(), "".to_owned())),
-                                       Some("".to_owned()))
-            .expect(&format!("failed to exec `{}`", self.config.adb_path));
-
-        if self.config.verbose {
-            println!("push ({}) {} {} {}",
-                     self.config.target,
-                     args.prog,
-                     copy_result.out,
-                     copy_result.err);
+    // This function is a poor man's attempt to debug rust-lang/rust#38620, if
+    // that's closed then this should be deleted
+    //
+    // This is a very "opportunistic" debugging attempt, so we ignore all
+    // errors here.
+    fn try_print_open_handles(&self) {
+        if !cfg!(windows) {
+            return
+        }
+        if self.config.mode != Incremental {
+            return
         }
 
-        logv(self.config, format!("executing ({}) {}", self.config.target, cmdline));
+        let filename = match self.testpaths.file.file_stem() {
+            Some(path) => path,
+            None => return,
+        };
 
-        let mut runargs = Vec::new();
-
-        // run test via adb_run_wrapper
-        runargs.push("shell".to_owned());
-        for (key, val) in env {
-            runargs.push(format!("{}={}", key, val));
-        }
-        runargs.push(format!("{}/../adb_run_wrapper.sh", self.config.adb_test_dir));
-        runargs.push(format!("{}", self.config.adb_test_dir));
-        runargs.push(format!("{}", prog_short));
-
-        for tv in &args.args {
-            runargs.push(tv.to_owned());
-        }
-        procsrv::run("",
-                     &self.config.adb_path,
-                     None,
-                     &runargs,
-                     vec!(("".to_owned(), "".to_owned())), Some("".to_owned()))
-            .expect(&format!("failed to exec `{}`", self.config.adb_path));
-
-        // get exitcode of result
-        runargs = Vec::new();
-        runargs.push("shell".to_owned());
-        runargs.push("cat".to_owned());
-        runargs.push(format!("{}/{}.exitcode", self.config.adb_test_dir, prog_short));
-
-        let procsrv::Result{ out: exitcode_out, err: _, status: _ } =
-            procsrv::run("",
-                         &self.config.adb_path,
-                         None,
-                         &runargs,
-                         vec!(("".to_owned(), "".to_owned())),
-                         Some("".to_owned()))
-            .expect(&format!("failed to exec `{}`", self.config.adb_path));
-
-        let mut exitcode: i32 = 0;
-        for c in exitcode_out.chars() {
-            if !c.is_numeric() { break; }
-            exitcode = exitcode * 10 + match c {
-                '0' ... '9' => c as i32 - ('0' as i32),
-                _ => 101,
-            }
-        }
-
-        // get stdout of result
-        runargs = Vec::new();
-        runargs.push("shell".to_owned());
-        runargs.push("cat".to_owned());
-        runargs.push(format!("{}/{}.stdout", self.config.adb_test_dir, prog_short));
-
-        let procsrv::Result{ out: stdout_out, err: _, status: _ } =
-            procsrv::run("",
-                         &self.config.adb_path,
-                         None,
-                         &runargs,
-                         vec!(("".to_owned(), "".to_owned())),
-                         Some("".to_owned()))
-            .expect(&format!("failed to exec `{}`", self.config.adb_path));
-
-        // get stderr of result
-        runargs = Vec::new();
-        runargs.push("shell".to_owned());
-        runargs.push("cat".to_owned());
-        runargs.push(format!("{}/{}.stderr", self.config.adb_test_dir, prog_short));
-
-        let procsrv::Result{ out: stderr_out, err: _, status: _ } =
-            procsrv::run("",
-                         &self.config.adb_path,
-                         None,
-                         &runargs,
-                         vec!(("".to_owned(), "".to_owned())),
-                         Some("".to_owned()))
-            .expect(&format!("failed to exec `{}`", self.config.adb_path));
-
-        self.dump_output(&stdout_out, &stderr_out);
-
-        ProcRes {
-            status: Status::Parsed(exitcode),
-            stdout: stdout_out,
-            stderr: stderr_out,
-            cmdline: cmdline
-        }
-    }
-
-    fn _arm_push_aux_shared_library(&self) {
-        let tdir = self.aux_output_dir_name();
-
-        let dirs = fs::read_dir(&tdir).unwrap();
-        for file in dirs {
-            let file = file.unwrap().path();
-            if file.extension().and_then(|s| s.to_str()) == Some("so") {
-                // FIXME (#9639): This needs to handle non-utf8 paths
-                let copy_result = procsrv::run("",
-                                               &self.config.adb_path,
-                                               None,
-                                               &[
-                                                   "push".to_owned(),
-                                                   file.to_str()
-                                                       .unwrap()
-                                                       .to_owned(),
-                                                   self.config.adb_test_dir.to_owned(),
-                                               ],
-                                               vec!(("".to_owned(),
-                                                     "".to_owned())),
-                                               Some("".to_owned()))
-                    .expect(&format!("failed to exec `{}`", self.config.adb_path));
-
-                if self.config.verbose {
-                    println!("push ({}) {:?} {} {}",
-                             self.config.target, file.display(),
-                             copy_result.out, copy_result.err);
-                }
-            }
-        }
+        let mut cmd = Command::new("handle.exe");
+        cmd.arg("-a").arg("-u");
+        cmd.arg(filename);
+        cmd.arg("-nobanner");
+        let output = match cmd.output() {
+            Ok(output) => output,
+            Err(_) => return,
+        };
+        println!("---------------------------------------------------");
+        println!("ran extra command to debug rust-lang/rust#38620: ");
+        println!("{:?}", cmd);
+        println!("result: {}", output.status);
+        println!("--- stdout ----------------------------------------");
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+        println!("--- stderr ----------------------------------------");
+        println!("{}", String::from_utf8_lossy(&output.stderr));
+        println!("---------------------------------------------------");
     }
 
     // codegen tests (using FileCheck)
@@ -1749,9 +1699,9 @@ actual:\n\
     fn compile_test_and_save_ir(&self) -> ProcRes {
         let aux_dir = self.aux_output_dir_name();
         // FIXME (#9639): This needs to handle non-utf8 paths
-        let mut link_args = vec!("-L".to_owned(),
-                                 aux_dir.to_str().unwrap().to_owned());
-        let llvm_args = vec!("--emit=llvm-ir".to_owned(),);
+        let mut link_args = vec!["-L".to_owned(),
+                                 aux_dir.to_str().unwrap().to_owned()];
+        let llvm_args = vec!["--emit=llvm-ir".to_owned(),];
         link_args.extend(llvm_args);
         let args = self.make_compile_args(link_args,
                                           &self.testpaths.file,
@@ -1768,8 +1718,8 @@ actual:\n\
         let proc_args = ProcArgs {
             // FIXME (#9639): This needs to handle non-utf8 paths
             prog: prog.to_str().unwrap().to_owned(),
-            args: vec!(format!("-input-file={}", irfile.to_str().unwrap()),
-                       self.testpaths.file.to_str().unwrap().to_owned())
+            args: vec![format!("-input-file={}", irfile.to_str().unwrap()),
+                       self.testpaths.file.to_str().unwrap().to_owned()]
         };
         self.compose_and_run(proc_args, Vec::new(), "", None, None)
     }
@@ -1808,20 +1758,128 @@ actual:\n\
 
         let out_dir = self.output_base_name();
         let _ = fs::remove_dir_all(&out_dir);
-        self.create_dir_racy(&out_dir);
+        create_dir_all(&out_dir).unwrap();
 
         let proc_res = self.document(&out_dir);
         if !proc_res.status.success() {
             self.fatal_proc_rec("rustdoc failed!", &proc_res);
         }
-        let root = self.find_rust_src_root().unwrap();
 
-        let res = self.cmd2procres(Command::new(&self.config.docck_python)
-                                   .arg(root.join("src/etc/htmldocck.py"))
-                                   .arg(out_dir)
-                                   .arg(&self.testpaths.file));
-        if !res.status.success() {
-            self.fatal_proc_rec("htmldocck failed!", &res);
+        if self.props.check_test_line_numbers_match == true {
+            self.check_rustdoc_test_option(proc_res);
+        } else {
+            let root = self.find_rust_src_root().unwrap();
+            let res = self.cmd2procres(Command::new(&self.config.docck_python)
+                                       .arg(root.join("src/etc/htmldocck.py"))
+                                       .arg(out_dir)
+                                       .arg(&self.testpaths.file));
+            if !res.status.success() {
+                self.fatal_proc_rec("htmldocck failed!", &res);
+            }
+        }
+    }
+
+    fn get_lines<P: AsRef<Path>>(&self, path: &P,
+                                 mut other_files: Option<&mut Vec<String>>) -> Vec<usize> {
+        let mut file = fs::File::open(path)
+                                .expect("markdown_test_output_check_entry File::open failed");
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .expect("markdown_test_output_check_entry read_to_string failed");
+        let mut ignore = false;
+        content.lines()
+               .enumerate()
+               .filter_map(|(line_nb, line)| {
+                   if (line.trim_left().starts_with("pub mod ") ||
+                       line.trim_left().starts_with("mod ")) &&
+                      line.ends_with(";") {
+                       if let Some(ref mut other_files) = other_files {
+                           other_files.push(line.rsplit("mod ")
+                                      .next()
+                                      .unwrap()
+                                      .replace(";", ""));
+                       }
+                       None
+                   } else {
+                       let sline = line.split("///").last().unwrap_or("");
+                       let line = sline.trim_left();
+                       if line.starts_with("```") {
+                           if ignore {
+                               ignore = false;
+                               None
+                           } else {
+                               ignore = true;
+                               Some(line_nb + 1)
+                           }
+                       } else {
+                           None
+                       }
+                   }
+               })
+               .collect()
+    }
+
+    fn check_rustdoc_test_option(&self, res: ProcRes) {
+        let mut other_files = Vec::new();
+        let mut files: HashMap<String, Vec<usize>> = HashMap::new();
+        let cwd = env::current_dir().unwrap();
+        files.insert(self.testpaths.file.strip_prefix(&cwd)
+                                        .unwrap_or(&self.testpaths.file)
+                                        .to_str()
+                                        .unwrap()
+                                        .replace('\\', "/"),
+                     self.get_lines(&self.testpaths.file, Some(&mut other_files)));
+        for other_file in other_files {
+            let mut path = self.testpaths.file.clone();
+            path.set_file_name(&format!("{}.rs", other_file));
+            files.insert(path.strip_prefix(&cwd)
+                             .unwrap_or(&path)
+                             .to_str()
+                             .unwrap()
+                             .replace('\\', "/"),
+                         self.get_lines(&path, None));
+        }
+
+        let mut tested = 0;
+        for _ in res.stdout.split("\n")
+                           .filter(|s| s.starts_with("test "))
+                           .inspect(|s| {
+                               let tmp: Vec<&str> = s.split(" - ").collect();
+                               if tmp.len() == 2 {
+                                   let path = tmp[0].rsplit("test ").next().unwrap();
+                                   if let Some(ref mut v) = files.get_mut(
+                                                                &path.replace('\\', "/")) {
+                                       tested += 1;
+                                       let mut iter = tmp[1].split("(line ");
+                                       iter.next();
+                                       let line = iter.next()
+                                                      .unwrap_or(")")
+                                                      .split(")")
+                                                      .next()
+                                                      .unwrap_or("0")
+                                                      .parse()
+                                                      .unwrap_or(0);
+                                       if let Ok(pos) = v.binary_search(&line) {
+                                           v.remove(pos);
+                                       } else {
+                                           self.fatal_proc_rec(
+                                               &format!("Not found doc test: \"{}\" in \"{}\":{:?}",
+                                                        s, path, v),
+                                               &res);
+                                       }
+                                   }
+                               }
+                           }) {}
+        if tested == 0 {
+            self.fatal_proc_rec(&format!("No test has been found... {:?}", files), &res);
+        } else {
+            for (entry, v) in &files {
+                if v.len() != 0 {
+                    self.fatal_proc_rec(&format!("Not found test at line{} \"{}\":{:?}",
+                                                 if v.len() > 1 { "s" } else { "" }, entry, v),
+                                        &res);
+                }
+            }
         }
     }
 
@@ -2076,9 +2134,18 @@ actual:\n\
         if tmpdir.exists() {
             self.aggressive_rm_rf(&tmpdir).unwrap();
         }
-        self.create_dir_racy(&tmpdir);
+        create_dir_all(&tmpdir).unwrap();
 
-        let mut cmd = Command::new("make");
+        let host = &self.config.host;
+        let make = if host.contains("bitrig") || host.contains("dragonfly") ||
+            host.contains("freebsd") || host.contains("netbsd") ||
+            host.contains("openbsd") {
+            "gmake"
+        } else {
+            "make"
+        };
+
+        let mut cmd = Command::new(make);
         cmd.current_dir(&self.testpaths.file)
            .env("TARGET", &self.config.target)
            .env("PYTHON", &self.config.docck_python)
@@ -2093,6 +2160,10 @@ actual:\n\
            .env("LLVM_COMPONENTS", &self.config.llvm_components)
            .env("LLVM_CXXFLAGS", &self.config.llvm_cxxflags);
 
+        // We don't want RUSTFLAGS set from the outside to interfere with
+        // compiler flags set in the test cases:
+        cmd.env_remove("RUSTFLAGS");
+
         if self.config.target.contains("msvc") {
             // We need to pass a path to `lib.exe`, so assume that `cc` is `cl.exe`
             // and that `lib.exe` lives next to it.
@@ -2105,18 +2176,23 @@ actual:\n\
                                                  .collect::<Vec<_>>().join(" ");
 
             cmd.env("IS_MSVC", "1")
+               .env("IS_WINDOWS", "1")
                .env("MSVC_LIB", format!("'{}' -nologo", lib.display()))
                .env("CC", format!("'{}' {}", self.config.cc, cflags))
                .env("CXX", &self.config.cxx);
         } else {
             cmd.env("CC", format!("{} {}", self.config.cc, self.config.cflags))
                .env("CXX", format!("{} {}", self.config.cxx, self.config.cflags));
+
+            if self.config.target.contains("windows") {
+                cmd.env("IS_WINDOWS", "1");
+            }
         }
 
         let output = cmd.output().expect("failed to spawn `make`");
         if !output.status.success() {
             let res = ProcRes {
-                status: Status::Normal(output.status),
+                status: output.status,
                 stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
                 cmdline: format!("{:?}", cmd),
@@ -2228,12 +2304,25 @@ actual:\n\
         }
     }
 
+    fn check_mir_test_timestamp(&self, test_name: &str, output_file: &Path) {
+        let t = |file| FileTime::from_last_modification_time(&fs::metadata(file).unwrap());
+        let source_file = &self.testpaths.file;
+        let output_time = t(output_file);
+        let source_time = t(source_file);
+        if source_time > output_time {
+            debug!("source file time: {:?} output file time: {:?}", source_time, output_time);
+            panic!("test source file `{}` is newer than potentially stale output file `{}`.",
+                   source_file.display(), test_name);
+        }
+    }
+
     fn compare_mir_test_output(&self, test_name: &str, expected_content: &Vec<&str>) {
         let mut output_file = PathBuf::new();
         output_file.push(self.get_mir_dump_dir());
         output_file.push(test_name);
         debug!("comparing the contests of: {:?}", output_file);
         debug!("with: {:?}", expected_content);
+        self.check_mir_test_timestamp(test_name, &output_file);
 
         let mut dumped_file = fs::File::open(output_file.clone()).unwrap();
         let mut dumped_string = String::new();
@@ -2259,7 +2348,18 @@ actual:\n\
                 };
             }
             if !found {
-                panic!("ran out of mir dump output to match against");
+                let normalize_all = dumped_string.lines()
+                                                 .map(nocomment_mir_line)
+                                                 .filter(|l| !l.is_empty())
+                                                 .collect::<Vec<_>>()
+                                                 .join("\n");
+                panic!("ran out of mir dump output to match against.\n\
+                        Did not find expected line: {:?}\n\
+                        Expected:\n{}\n\
+                        Actual:\n{}",
+                        expected_line,
+                        expected_content.join("\n"),
+                        normalize_all);
             }
         }
     }
@@ -2314,8 +2414,13 @@ actual:\n\
         println!("normalized {}:\n{}\n", kind, actual);
         println!("expected {}:\n{}\n", kind, expected);
         println!("diff of {}:\n", kind);
-        for line in uidiff::diff_lines(actual, expected) {
-            println!("{}", line);
+
+        for diff in diff::lines(expected, actual) {
+            match diff {
+                diff::Result::Left(l)    => println!("-{}", l),
+                diff::Result::Both(l, _) => println!(" {}", l),
+                diff::Result::Right(r)   => println!("+{}", r),
+            }
         }
 
         let output_file = self.output_base_name().with_extension(kind);
@@ -2339,15 +2444,10 @@ struct ProcArgs {
 }
 
 pub struct ProcRes {
-    status: Status,
+    status: ExitStatus,
     stdout: String,
     stderr: String,
     cmdline: String,
-}
-
-enum Status {
-    Parsed(i32),
-    Normal(ExitStatus),
 }
 
 impl ProcRes {
@@ -2373,42 +2473,20 @@ impl ProcRes {
     }
 }
 
-impl Status {
-    fn code(&self) -> Option<i32> {
-        match *self {
-            Status::Parsed(i) => Some(i),
-            Status::Normal(ref e) => e.code(),
-        }
-    }
-
-    fn success(&self) -> bool {
-        match *self {
-            Status::Parsed(i) => i == 0,
-            Status::Normal(ref e) => e.success(),
-        }
-    }
-}
-
-impl fmt::Display for Status {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Status::Parsed(i) => write!(f, "exit code: {}", i),
-            Status::Normal(ref e) => e.fmt(f),
-        }
-    }
-}
-
 enum TargetLocation {
     ThisFile(PathBuf),
     ThisDirectory(PathBuf),
 }
 
 fn normalize_mir_line(line: &str) -> String {
-    let no_comments = if let Some(idx) = line.find("//") {
+    nocomment_mir_line(line).replace(char::is_whitespace, "")
+}
+
+fn nocomment_mir_line(line: &str) -> &str {
+    if let Some(idx) = line.find("//") {
         let (l, _) = line.split_at(idx);
-        l
+        l.trim_right()
     } else {
         line
-    };
-    no_comments.replace(char::is_whitespace, "")
+    }
 }

@@ -13,22 +13,23 @@
 #![unstable(feature = "thread_local_internals", issue = "0")]
 
 use cell::UnsafeCell;
+use fmt;
 use mem;
 
 /// A thread local storage key which owns its contents.
 ///
 /// This key uses the fastest possible implementation available to it for the
-/// target platform. It is instantiated with the `thread_local!` macro and the
-/// primary method is the `with` method.
+/// target platform. It is instantiated with the [`thread_local!`] macro and the
+/// primary method is the [`with`] method.
 ///
-/// The `with` method yields a reference to the contained value which cannot be
+/// The [`with`] method yields a reference to the contained value which cannot be
 /// sent across threads or escape the given closure.
 ///
 /// # Initialization and Destruction
 ///
-/// Initialization is dynamically performed on the first call to `with()`
-/// within a thread, and values support destructors which will be run when a
-/// thread exits.
+/// Initialization is dynamically performed on the first call to [`with`]
+/// within a thread, and values that implement [`Drop`] get destructed when a
+/// thread exits. Some caveats apply, which are explained below.
 ///
 /// # Examples
 ///
@@ -73,9 +74,13 @@ use mem;
 ///    destroyed, but not all platforms have this guard. Those platforms that do
 ///    not guard typically have a synthetic limit after which point no more
 ///    destructors are run.
-/// 3. On OSX, initializing TLS during destruction of other TLS slots can
+/// 3. On macOS, initializing TLS during destruction of other TLS slots can
 ///    sometimes cancel *all* destructors for the current thread, whether or not
 ///    the slots have already had their destructors run or not.
+///
+/// [`with`]: ../../std/thread/struct.LocalKey.html#method.with
+/// [`thread_local!`]: ../../std/macro.thread_local.html
+/// [`Drop`]: ../../std/ops/trait.Drop.html
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct LocalKey<T: 'static> {
     // This outer `LocalKey<T>` type is what's going to be stored in statics,
@@ -98,7 +103,14 @@ pub struct LocalKey<T: 'static> {
     init: fn() -> T,
 }
 
-/// Declare a new thread local storage key of type `std::thread::LocalKey`.
+#[stable(feature = "std_debug", since = "1.16.0")]
+impl<T: 'static> fmt::Debug for LocalKey<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.pad("LocalKey { .. }")
+    }
+}
+
+/// Declare a new thread local storage key of type [`std::thread::LocalKey`].
 ///
 /// # Syntax
 ///
@@ -116,8 +128,10 @@ pub struct LocalKey<T: 'static> {
 /// # fn main() {}
 /// ```
 ///
-/// See [LocalKey documentation](thread/struct.LocalKey.html) for more
+/// See [LocalKey documentation][`std::thread::LocalKey`] for more
 /// information.
+///
+/// [`std::thread::LocalKey`]: ../std/thread/struct.LocalKey.html
 #[macro_export]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[allow_internal_unstable]
@@ -166,8 +180,8 @@ macro_rules! __thread_local_inner {
         {
             #[thread_local]
             #[cfg(target_thread_local)]
-            static __KEY: $crate::thread::__ElfLocalKeyInner<$t> =
-                $crate::thread::__ElfLocalKeyInner::new();
+            static __KEY: $crate::thread::__FastLocalKeyInner<$t> =
+                $crate::thread::__FastLocalKeyInner::new();
 
             #[cfg(not(target_thread_local))]
             static __KEY: $crate::thread::__OsLocalKeyInner<$t> =
@@ -184,14 +198,16 @@ macro_rules! __thread_local_inner {
 #[unstable(feature = "thread_local_state",
            reason = "state querying was recently added",
            issue = "27716")]
-#[derive(Eq, PartialEq, Copy, Clone)]
+#[derive(Debug, Eq, PartialEq, Copy, Clone)]
 pub enum LocalKeyState {
     /// All keys are in this state whenever a thread starts. Keys will
-    /// transition to the `Valid` state once the first call to `with` happens
+    /// transition to the `Valid` state once the first call to [`with`] happens
     /// and the initialization expression succeeds.
     ///
     /// Keys in the `Uninitialized` state will yield a reference to the closure
-    /// passed to `with` so long as the initialization routine does not panic.
+    /// passed to [`with`] so long as the initialization routine does not panic.
+    ///
+    /// [`with`]: ../../std/thread/struct.LocalKey.html#method.with
     Uninitialized,
 
     /// Once a key has been accessed successfully, it will enter the `Valid`
@@ -200,7 +216,9 @@ pub enum LocalKeyState {
     /// `Destroyed` state.
     ///
     /// Keys in the `Valid` state will be guaranteed to yield a reference to the
-    /// closure passed to `with`.
+    /// closure passed to [`with`].
+    ///
+    /// [`with`]: ../../std/thread/struct.LocalKey.html#method.with
     Valid,
 
     /// When a thread exits, the destructors for keys will be run (if
@@ -208,7 +226,9 @@ pub enum LocalKeyState {
     /// destructor has run, a key is in the `Destroyed` state.
     ///
     /// Keys in the `Destroyed` states will trigger a panic when accessed via
-    /// `with`.
+    /// [`with`].
+    ///
+    /// [`with`]: ../../std/thread/struct.LocalKey.html#method.with
     Destroyed,
 }
 
@@ -275,23 +295,26 @@ impl<T: 'static> LocalKey<T> {
     /// Query the current state of this key.
     ///
     /// A key is initially in the `Uninitialized` state whenever a thread
-    /// starts. It will remain in this state up until the first call to `with`
+    /// starts. It will remain in this state up until the first call to [`with`]
     /// within a thread has run the initialization expression successfully.
     ///
     /// Once the initialization expression succeeds, the key transitions to the
-    /// `Valid` state which will guarantee that future calls to `with` will
+    /// `Valid` state which will guarantee that future calls to [`with`] will
     /// succeed within the thread.
     ///
     /// When a thread exits, each key will be destroyed in turn, and as keys are
     /// destroyed they will enter the `Destroyed` state just before the
     /// destructor starts to run. Keys may remain in the `Destroyed` state after
     /// destruction has completed. Keys without destructors (e.g. with types
-    /// that are `Copy`), may never enter the `Destroyed` state.
+    /// that are [`Copy`]), may never enter the `Destroyed` state.
     ///
     /// Keys in the `Uninitialized` state can be accessed so long as the
     /// initialization does not panic. Keys in the `Valid` state are guaranteed
     /// to be able to be accessed. Keys in the `Destroyed` state will panic on
-    /// any call to `with`.
+    /// any call to [`with`].
+    ///
+    /// [`with`]: ../../std/thread/struct.LocalKey.html#method.with
+    /// [`Copy`]: ../../std/marker/trait.Copy.html
     #[unstable(feature = "thread_local_state",
                reason = "state querying was recently added",
                issue = "27716")]
@@ -310,156 +333,10 @@ impl<T: 'static> LocalKey<T> {
     }
 }
 
-#[cfg(target_thread_local)]
-#[doc(hidden)]
-pub mod elf {
-    use cell::{Cell, UnsafeCell};
-    use intrinsics;
-    use ptr;
-
-    pub struct Key<T> {
-        inner: UnsafeCell<Option<T>>,
-
-        // Metadata to keep track of the state of the destructor. Remember that
-        // these variables are thread-local, not global.
-        dtor_registered: Cell<bool>,
-        dtor_running: Cell<bool>,
-    }
-
-    unsafe impl<T> ::marker::Sync for Key<T> { }
-
-    impl<T> Key<T> {
-        pub const fn new() -> Key<T> {
-            Key {
-                inner: UnsafeCell::new(None),
-                dtor_registered: Cell::new(false),
-                dtor_running: Cell::new(false)
-            }
-        }
-
-        pub fn get(&'static self) -> Option<&'static UnsafeCell<Option<T>>> {
-            unsafe {
-                if intrinsics::needs_drop::<T>() && self.dtor_running.get() {
-                    return None
-                }
-                self.register_dtor();
-            }
-            Some(&self.inner)
-        }
-
-        unsafe fn register_dtor(&self) {
-            if !intrinsics::needs_drop::<T>() || self.dtor_registered.get() {
-                return
-            }
-
-            register_dtor(self as *const _ as *mut u8,
-                          destroy_value::<T>);
-            self.dtor_registered.set(true);
-        }
-    }
-
-    // Since what appears to be glibc 2.18 this symbol has been shipped which
-    // GCC and clang both use to invoke destructors in thread_local globals, so
-    // let's do the same!
-    //
-    // Note, however, that we run on lots older linuxes, as well as cross
-    // compiling from a newer linux to an older linux, so we also have a
-    // fallback implementation to use as well.
-    //
-    // Due to rust-lang/rust#18804, make sure this is not generic!
-    #[cfg(target_os = "linux")]
-    unsafe fn register_dtor(t: *mut u8, dtor: unsafe extern fn(*mut u8)) {
-        use mem;
-        use libc;
-        use sys_common::thread_local as os;
-
-        extern {
-            #[linkage = "extern_weak"]
-            static __dso_handle: *mut u8;
-            #[linkage = "extern_weak"]
-            static __cxa_thread_atexit_impl: *const libc::c_void;
-        }
-        if !__cxa_thread_atexit_impl.is_null() {
-            type F = unsafe extern fn(dtor: unsafe extern fn(*mut u8),
-                                      arg: *mut u8,
-                                      dso_handle: *mut u8) -> libc::c_int;
-            mem::transmute::<*const libc::c_void, F>(__cxa_thread_atexit_impl)
-            (dtor, t, &__dso_handle as *const _ as *mut _);
-            return
-        }
-
-        // The fallback implementation uses a vanilla OS-based TLS key to track
-        // the list of destructors that need to be run for this thread. The key
-        // then has its own destructor which runs all the other destructors.
-        //
-        // The destructor for DTORS is a little special in that it has a `while`
-        // loop to continuously drain the list of registered destructors. It
-        // *should* be the case that this loop always terminates because we
-        // provide the guarantee that a TLS key cannot be set after it is
-        // flagged for destruction.
-        static DTORS: os::StaticKey = os::StaticKey::new(Some(run_dtors));
-        type List = Vec<(*mut u8, unsafe extern fn(*mut u8))>;
-        if DTORS.get().is_null() {
-            let v: Box<List> = box Vec::new();
-            DTORS.set(Box::into_raw(v) as *mut u8);
-        }
-        let list: &mut List = &mut *(DTORS.get() as *mut List);
-        list.push((t, dtor));
-
-        unsafe extern fn run_dtors(mut ptr: *mut u8) {
-            while !ptr.is_null() {
-                let list: Box<List> = Box::from_raw(ptr as *mut List);
-                for &(ptr, dtor) in list.iter() {
-                    dtor(ptr);
-                }
-                ptr = DTORS.get();
-                DTORS.set(ptr::null_mut());
-            }
-        }
-    }
-
-    // OSX's analog of the above linux function is this _tlv_atexit function.
-    // The disassembly of thread_local globals in C++ (at least produced by
-    // clang) will have this show up in the output.
-    #[cfg(target_os = "macos")]
-    unsafe fn register_dtor(t: *mut u8, dtor: unsafe extern fn(*mut u8)) {
-        extern {
-            fn _tlv_atexit(dtor: unsafe extern fn(*mut u8),
-                           arg: *mut u8);
-        }
-        _tlv_atexit(dtor, t);
-    }
-
-    pub unsafe extern fn destroy_value<T>(ptr: *mut u8) {
-        let ptr = ptr as *mut Key<T>;
-        // Right before we run the user destructor be sure to flag the
-        // destructor as running for this thread so calls to `get` will return
-        // `None`.
-        (*ptr).dtor_running.set(true);
-
-        // The OSX implementation of TLS apparently had an odd aspect to it
-        // where the pointer we have may be overwritten while this destructor
-        // is running. Specifically if a TLS destructor re-accesses TLS it may
-        // trigger a re-initialization of all TLS variables, paving over at
-        // least some destroyed ones with initial values.
-        //
-        // This means that if we drop a TLS value in place on OSX that we could
-        // revert the value to its original state halfway through the
-        // destructor, which would be bad!
-        //
-        // Hence, we use `ptr::read` on OSX (to move to a "safe" location)
-        // instead of drop_in_place.
-        if cfg!(target_os = "macos") {
-            ptr::read((*ptr).inner.get());
-        } else {
-            ptr::drop_in_place((*ptr).inner.get());
-        }
-    }
-}
-
 #[doc(hidden)]
 pub mod os {
     use cell::{Cell, UnsafeCell};
+    use fmt;
     use marker;
     use ptr;
     use sys_common::thread_local::StaticKey as OsStaticKey;
@@ -468,6 +345,12 @@ pub mod os {
         // OS-TLS key that we'll use to key off.
         os: OsStaticKey,
         marker: marker::PhantomData<Cell<T>>,
+    }
+
+    impl<T> fmt::Debug for Key<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.pad("Key { .. }")
+        }
     }
 
     unsafe impl<T> ::marker::Sync for Key<T> { }
@@ -656,9 +539,9 @@ mod tests {
     }
 
     // Note that this test will deadlock if TLS destructors aren't run (this
-    // requires the destructor to be run to pass the test). OSX has a known bug
+    // requires the destructor to be run to pass the test). macOS has a known bug
     // where dtors-in-dtors may cancel other destructors, so we just ignore this
-    // test on OSX.
+    // test on macOS.
     #[test]
     #[cfg_attr(target_os = "macos", ignore)]
     fn dtors_in_dtors_in_dtors() {

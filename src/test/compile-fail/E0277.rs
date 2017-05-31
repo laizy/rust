@@ -8,6 +8,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::path::Path;
+
 trait Foo {
     fn bar(&self);
 }
@@ -16,9 +18,15 @@ fn some_func<T: Foo>(foo: T) {
     foo.bar();
 }
 
+fn f(p: Path) { }
+//~^ ERROR the trait bound `[u8]: std::marker::Sized` is not satisfied in `std::path::Path`
+//~| NOTE `[u8]` does not have a constant size known at compile-time
+//~| NOTE required because it appears within the type `std::path::Path`
+//~| NOTE all local variables must have a statically known size
+
 fn main() {
     some_func(5i32);
     //~^ ERROR the trait bound `i32: Foo` is not satisfied
-    //~| NOTE trait `i32: Foo` not satisfied
+    //~| NOTE the trait `Foo` is not implemented for `i32`
     //~| NOTE required by `some_func`
 }

@@ -38,7 +38,7 @@ static ENV_LOCK: Mutex = Mutex::new();
 
 extern {
     #[cfg(not(target_os = "dragonfly"))]
-    #[cfg_attr(any(target_os = "linux", target_os = "emscripten"),
+    #[cfg_attr(any(target_os = "linux", target_os = "emscripten", target_os = "fuchsia"),
                link_name = "__errno_location")]
     #[cfg_attr(any(target_os = "bitrig",
                    target_os = "netbsd",
@@ -64,7 +64,7 @@ pub fn errno() -> i32 {
 }
 
 /// Sets the platform-specific value of errno
-#[cfg(target_os = "solaris")] // only needed for readdir so far
+#[cfg(any(target_os = "solaris", target_os = "fuchsia"))] // only needed for readdir so far
 pub fn set_errno(e: i32) {
     unsafe {
         *errno_location() = e as c_int
@@ -78,7 +78,7 @@ pub fn errno() -> i32 {
         static errno: c_int;
     }
 
-    errno as i32
+    unsafe { errno as i32 }
 }
 
 /// Gets a detailed string description for the given error number.
@@ -193,7 +193,7 @@ impl StdError for JoinPathsError {
     fn description(&self) -> &str { "failed to join paths" }
 }
 
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
 pub fn current_exe() -> io::Result<PathBuf> {
     unsafe {
         let mut mib = [libc::CTL_KERN as c_int,
@@ -216,11 +216,6 @@ pub fn current_exe() -> io::Result<PathBuf> {
         v.set_len(sz - 1); // chop off trailing NUL
         Ok(PathBuf::from(OsString::from_vec(v)))
     }
-}
-
-#[cfg(target_os = "dragonfly")]
-pub fn current_exe() -> io::Result<PathBuf> {
-    ::fs::read_link("/proc/curproc/file")
 }
 
 #[cfg(target_os = "netbsd")]
@@ -258,7 +253,12 @@ pub fn current_exe() -> io::Result<PathBuf> {
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "emscripten"))]
 pub fn current_exe() -> io::Result<PathBuf> {
-    ::fs::read_link("/proc/self/exe")
+    let selfexe = PathBuf::from("/proc/self/exe");
+    if selfexe.exists() {
+        ::fs::read_link(selfexe)
+    } else {
+        Err(io::Error::new(io::ErrorKind::Other, "no /proc/self/exe available. Is /proc mounted?"))
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -344,6 +344,12 @@ pub fn current_exe() -> io::Result<PathBuf> {
             Ok(PathBuf::from(OsStr::from_bytes(name)))
         }
     }
+}
+
+#[cfg(target_os = "fuchsia")]
+pub fn current_exe() -> io::Result<PathBuf> {
+    use io::ErrorKind;
+    Err(io::Error::new(ErrorKind::Other, "Not yet implemented on fuchsia"))
 }
 
 pub struct Env {
@@ -482,41 +488,21 @@ pub fn home_dir() -> Option<PathBuf> {
                   target_os = "nacl",
                   target_os = "emscripten")))]
     unsafe fn fallback() -> Option<OsString> {
-        #[cfg(not(target_os = "solaris"))]
-        unsafe fn getpwduid_r(me: libc::uid_t, passwd: &mut libc::passwd,
-                              buf: &mut Vec<c_char>) -> Option<()> {
-            let mut result = ptr::null_mut();
-            match libc::getpwuid_r(me, passwd, buf.as_mut_ptr(),
-                                   buf.capacity(),
-                                   &mut result) {
-                0 if !result.is_null() => Some(()),
-                _ => None
-            }
-        }
-
-        #[cfg(target_os = "solaris")]
-        unsafe fn getpwduid_r(me: libc::uid_t, passwd: &mut libc::passwd,
-                              buf: &mut Vec<c_char>) -> Option<()> {
-            // getpwuid_r semantics is different on Illumos/Solaris:
-            // http://illumos.org/man/3c/getpwuid_r
-            let result = libc::getpwuid_r(me, passwd, buf.as_mut_ptr(),
-                                          buf.capacity());
-            if result.is_null() { None } else { Some(()) }
-        }
-
         let amt = match libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) {
             n if n < 0 => 512 as usize,
             n => n as usize,
         };
         let mut buf = Vec::with_capacity(amt);
         let mut passwd: libc::passwd = mem::zeroed();
-
-        if getpwduid_r(libc::getuid(), &mut passwd, &mut buf).is_some() {
-            let ptr = passwd.pw_dir as *const _;
-            let bytes = CStr::from_ptr(ptr).to_bytes().to_vec();
-            Some(OsStringExt::from_vec(bytes))
-        } else {
-            None
+        let mut result = ptr::null_mut();
+        match libc::getpwuid_r(libc::getuid(), &mut passwd, buf.as_mut_ptr(),
+                               buf.capacity(), &mut result) {
+            0 if !result.is_null() => {
+                let ptr = passwd.pw_dir as *const _;
+                let bytes = CStr::from_ptr(ptr).to_bytes().to_vec();
+                Some(OsStringExt::from_vec(bytes))
+            },
+            _ => None,
         }
     }
 }

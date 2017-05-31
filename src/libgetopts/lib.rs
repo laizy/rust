@@ -78,9 +78,9 @@
 //! ```
 
 #![crate_name = "getopts"]
-#![unstable(feature = "rustc_private",
+#![cfg_attr(stage0, unstable(feature = "rustc_private",
             reason = "use the crates.io `getopts` library instead",
-            issue = "27812")]
+            issue = "27812"))]
 #![crate_type = "rlib"]
 #![crate_type = "dylib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
@@ -90,7 +90,8 @@
        test(attr(deny(warnings))))]
 
 #![deny(missing_docs)]
-#![feature(staged_api)]
+#![deny(warnings)]
+#![cfg_attr(stage0, feature(staged_api))]
 
 use self::Name::*;
 use self::HasArg::*;
@@ -968,7 +969,6 @@ fn test_split_within() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::Fail::*;
 
     use std::result::Result::{Err, Ok};
     use std::result;
@@ -1610,8 +1610,8 @@ Options:
 
     #[test]
     fn test_args_with_equals() {
-        let args = vec!("--one".to_string(), "A=B".to_string(),
-                        "--two=C=D".to_string());
+        let args = vec!["--one".to_string(), "A=B".to_string(),
+                        "--two=C=D".to_string()];
         let opts = vec![optopt("o", "one", "One", "INFO"),
                         optopt("t", "two", "Two", "INFO")];
         let matches = &match getopts(&args, &opts) {

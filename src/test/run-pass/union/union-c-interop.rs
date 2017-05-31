@@ -8,8 +8,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-#![feature(untagged_unions)]
-
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct LARGE_INTEGER_U {
@@ -25,7 +23,7 @@ union LARGE_INTEGER {
   QuadPart: u64,
 }
 
-#[link(name = "rust_test_helpers")]
+#[link(name = "rust_test_helpers", kind = "static")]
 extern "C" {
     fn increment_all_parts(_: LARGE_INTEGER) -> LARGE_INTEGER;
 }

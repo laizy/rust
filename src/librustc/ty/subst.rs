@@ -11,11 +11,12 @@
 // Type substitutions.
 
 use hir::def_id::DefId;
-use ty::{self, Slice, Ty, TyCtxt};
+use ty::{self, Slice, Region, Ty, TyCtxt};
 use ty::fold::{TypeFoldable, TypeFolder, TypeVisitor};
 
 use serialize::{self, Encodable, Encoder, Decodable, Decoder};
 use syntax_pos::{Span, DUMMY_SP};
+use rustc_data_structures::accumulate_vec::AccumulateVec;
 
 use core::nonzero::NonZero;
 use std::fmt;
@@ -31,7 +32,7 @@ use std::mem;
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Kind<'tcx> {
     ptr: NonZero<usize>,
-    marker: PhantomData<(Ty<'tcx>, &'tcx ty::Region)>
+    marker: PhantomData<(Ty<'tcx>, ty::Region<'tcx>)>
 }
 
 const TAG_MASK: usize = 0b11;
@@ -53,8 +54,8 @@ impl<'tcx> From<Ty<'tcx>> for Kind<'tcx> {
     }
 }
 
-impl<'tcx> From<&'tcx ty::Region> for Kind<'tcx> {
-    fn from(r: &'tcx ty::Region) -> Kind<'tcx> {
+impl<'tcx> From<ty::Region<'tcx>> for Kind<'tcx> {
+    fn from(r: ty::Region<'tcx>) -> Kind<'tcx> {
         // Ensure we can use the tag bits.
         assert_eq!(mem::align_of_val(r) & TAG_MASK, 0);
 
@@ -71,7 +72,7 @@ impl<'tcx> From<&'tcx ty::Region> for Kind<'tcx> {
 impl<'tcx> Kind<'tcx> {
     #[inline]
     unsafe fn downcast<T>(self, tag: usize) -> Option<&'tcx T> {
-        let ptr = *self.ptr;
+        let ptr = self.ptr.get();
         if ptr & TAG_MASK == tag {
             Some(&*((ptr & !TAG_MASK) as *const _))
         } else {
@@ -87,7 +88,7 @@ impl<'tcx> Kind<'tcx> {
     }
 
     #[inline]
-    pub fn as_region(self) -> Option<&'tcx ty::Region> {
+    pub fn as_region(self) -> Option<ty::Region<'tcx>> {
         unsafe {
             self.downcast(REGION_TAG)
         }
@@ -101,7 +102,7 @@ impl<'tcx> fmt::Debug for Kind<'tcx> {
         } else if let Some(r) = self.as_region() {
             write!(f, "{:?}", r)
         } else {
-            write!(f, "<unknwon @ {:p}>", *self.ptr as *const ())
+            write!(f, "<unknown @ {:p}>", self.ptr.get() as *const ())
         }
     }
 }
@@ -152,7 +153,7 @@ impl<'tcx> Decodable for Kind<'tcx> {
             d.read_enum_variant(&["Ty", "Region"], |d, tag| {
                 match tag {
                     TYPE_TAG => Ty::decode(d).map(Kind::from),
-                    REGION_TAG => <&ty::Region>::decode(d).map(Kind::from),
+                    REGION_TAG => Region::decode(d).map(Kind::from),
                     _ => Err(d.error("invalid Kind tag"))
                 }
             })
@@ -164,29 +165,12 @@ impl<'tcx> Decodable for Kind<'tcx> {
 pub type Substs<'tcx> = Slice<Kind<'tcx>>;
 
 impl<'a, 'gcx, 'tcx> Substs<'tcx> {
-    pub fn new<I>(tcx: TyCtxt<'a, 'gcx, 'tcx>, params: I)
-                  -> &'tcx Substs<'tcx>
-    where I: IntoIterator<Item=Kind<'tcx>> {
-        tcx.mk_substs(params.into_iter().collect())
-    }
-
-    pub fn maybe_new<I, E>(tcx: TyCtxt<'a, 'gcx, 'tcx>, params: I)
-                           -> Result<&'tcx Substs<'tcx>, E>
-    where I: IntoIterator<Item=Result<Kind<'tcx>, E>> {
-        Ok(Substs::new(tcx, params.into_iter().collect::<Result<Vec<_>, _>>()?))
-    }
-
-    pub fn new_trait(tcx: TyCtxt<'a, 'gcx, 'tcx>,
-                     s: Ty<'tcx>,
-                     t: &[Ty<'tcx>])
-                    -> &'tcx Substs<'tcx>
-    {
-        let t = iter::once(s).chain(t.iter().cloned());
-        Substs::new(tcx, t.map(Kind::from))
-    }
-
-    pub fn empty(tcx: TyCtxt<'a, 'gcx, 'tcx>) -> &'tcx Substs<'tcx> {
-        Substs::new(tcx, iter::empty())
+    /// Creates a Substs that maps each generic parameter to itself.
+    pub fn identity_for_item(tcx: TyCtxt<'a, 'gcx, 'tcx>, def_id: DefId)
+                             -> &'tcx Substs<'tcx> {
+        Substs::for_item(tcx, def_id, |def, _| {
+            tcx.mk_region(ty::ReEarlyBound(def.to_early_bound_region_data()))
+        }, |def, _| tcx.mk_param_from_def(def))
     }
 
     /// Creates a Substs for generic parameter definitions,
@@ -199,29 +183,51 @@ impl<'a, 'gcx, 'tcx> Substs<'tcx> {
                             mut mk_region: FR,
                             mut mk_type: FT)
                             -> &'tcx Substs<'tcx>
-    where FR: FnMut(&ty::RegionParameterDef, &[Kind<'tcx>]) -> &'tcx ty::Region,
-          FT: FnMut(&ty::TypeParameterDef<'tcx>, &[Kind<'tcx>]) -> Ty<'tcx> {
-        let defs = tcx.lookup_generics(def_id);
+    where FR: FnMut(&ty::RegionParameterDef, &[Kind<'tcx>]) -> ty::Region<'tcx>,
+          FT: FnMut(&ty::TypeParameterDef, &[Kind<'tcx>]) -> Ty<'tcx> {
+        let defs = tcx.generics_of(def_id);
         let mut substs = Vec::with_capacity(defs.count());
-
         Substs::fill_item(&mut substs, tcx, defs, &mut mk_region, &mut mk_type);
+        tcx.intern_substs(&substs)
+    }
 
-        Substs::new(tcx, substs)
+    pub fn extend_to<FR, FT>(&self,
+                             tcx: TyCtxt<'a, 'gcx, 'tcx>,
+                             def_id: DefId,
+                             mut mk_region: FR,
+                             mut mk_type: FT)
+                             -> &'tcx Substs<'tcx>
+    where FR: FnMut(&ty::RegionParameterDef, &[Kind<'tcx>]) -> ty::Region<'tcx>,
+          FT: FnMut(&ty::TypeParameterDef, &[Kind<'tcx>]) -> Ty<'tcx>
+    {
+        let defs = tcx.generics_of(def_id);
+        let mut result = Vec::with_capacity(defs.count());
+        result.extend(self[..].iter().cloned());
+        Substs::fill_single(&mut result, defs, &mut mk_region, &mut mk_type);
+        tcx.intern_substs(&result)
     }
 
     fn fill_item<FR, FT>(substs: &mut Vec<Kind<'tcx>>,
                          tcx: TyCtxt<'a, 'gcx, 'tcx>,
-                         defs: &ty::Generics<'tcx>,
+                         defs: &ty::Generics,
                          mk_region: &mut FR,
                          mk_type: &mut FT)
-    where FR: FnMut(&ty::RegionParameterDef, &[Kind<'tcx>]) -> &'tcx ty::Region,
-          FT: FnMut(&ty::TypeParameterDef<'tcx>, &[Kind<'tcx>]) -> Ty<'tcx> {
+    where FR: FnMut(&ty::RegionParameterDef, &[Kind<'tcx>]) -> ty::Region<'tcx>,
+          FT: FnMut(&ty::TypeParameterDef, &[Kind<'tcx>]) -> Ty<'tcx> {
 
         if let Some(def_id) = defs.parent {
-            let parent_defs = tcx.lookup_generics(def_id);
+            let parent_defs = tcx.generics_of(def_id);
             Substs::fill_item(substs, tcx, parent_defs, mk_region, mk_type);
         }
+        Substs::fill_single(substs, defs, mk_region, mk_type)
+    }
 
+    fn fill_single<FR, FT>(substs: &mut Vec<Kind<'tcx>>,
+                           defs: &ty::Generics,
+                           mk_region: &mut FR,
+                           mk_type: &mut FT)
+    where FR: FnMut(&ty::RegionParameterDef, &[Kind<'tcx>]) -> ty::Region<'tcx>,
+          FT: FnMut(&ty::TypeParameterDef, &[Kind<'tcx>]) -> Ty<'tcx> {
         // Handle Self first, before all regions.
         let mut types = defs.types.iter();
         if defs.parent.is_none() && defs.has_self {
@@ -249,18 +255,12 @@ impl<'a, 'gcx, 'tcx> Substs<'tcx> {
     }
 
     #[inline]
-    pub fn params(&self) -> &[Kind<'tcx>] {
-        // FIXME (dikaiosune) this should be removed, and corresponding compilation errors fixed
-        self
-    }
-
-    #[inline]
     pub fn types(&'a self) -> impl DoubleEndedIterator<Item=Ty<'tcx>> + 'a {
         self.iter().filter_map(|k| k.as_type())
     }
 
     #[inline]
-    pub fn regions(&'a self) -> impl DoubleEndedIterator<Item=&'tcx ty::Region> + 'a {
+    pub fn regions(&'a self) -> impl DoubleEndedIterator<Item=ty::Region<'tcx>> + 'a {
         self.iter().filter_map(|k| k.as_region())
     }
 
@@ -272,7 +272,7 @@ impl<'a, 'gcx, 'tcx> Substs<'tcx> {
     }
 
     #[inline]
-    pub fn region_at(&self, i: usize) -> &'tcx ty::Region {
+    pub fn region_at(&self, i: usize) -> ty::Region<'tcx> {
         self[i].as_region().unwrap_or_else(|| {
             bug!("expected region for param #{} in {:?}", i, self);
         })
@@ -284,7 +284,7 @@ impl<'a, 'gcx, 'tcx> Substs<'tcx> {
     }
 
     #[inline]
-    pub fn region_for_def(&self, def: &ty::RegionParameterDef) -> &'tcx ty::Region {
+    pub fn region_for_def(&self, def: &ty::RegionParameterDef) -> ty::Region<'tcx> {
         self.region_at(def.index as usize)
     }
 
@@ -297,15 +297,27 @@ impl<'a, 'gcx, 'tcx> Substs<'tcx> {
                        source_ancestor: DefId,
                        target_substs: &Substs<'tcx>)
                        -> &'tcx Substs<'tcx> {
-        let defs = tcx.lookup_generics(source_ancestor);
-        Substs::new(tcx, target_substs.iter().chain(&self[defs.own_count()..]).cloned())
+        let defs = tcx.generics_of(source_ancestor);
+        tcx.mk_substs(target_substs.iter().chain(&self[defs.own_count()..]).cloned())
+    }
+
+    pub fn truncate_to(&self, tcx: TyCtxt<'a, 'gcx, 'tcx>, generics: &ty::Generics)
+                       -> &'tcx Substs<'tcx> {
+        tcx.mk_substs(self.iter().take(generics.count()).cloned())
     }
 }
 
 impl<'tcx> TypeFoldable<'tcx> for &'tcx Substs<'tcx> {
     fn super_fold_with<'gcx: 'tcx, F: TypeFolder<'gcx, 'tcx>>(&self, folder: &mut F) -> Self {
-        let params = self.iter().map(|k| k.fold_with(folder)).collect();
-        folder.tcx().mk_substs(params)
+        let params: AccumulateVec<[_; 8]> = self.iter().map(|k| k.fold_with(folder)).collect();
+
+        // If folding doesn't change the substs, it's faster to avoid
+        // calling `mk_substs` and instead reuse the existing substs.
+        if params[..] == self[..] {
+            self
+        } else {
+            folder.tcx().intern_substs(&params)
+        }
     }
 
     fn fold_with<'gcx: 'tcx, F: TypeFolder<'gcx, 'tcx>>(&self, folder: &mut F) -> Self {
@@ -384,7 +396,7 @@ impl<'a, 'gcx, 'tcx> TypeFolder<'gcx, 'tcx> for SubstFolder<'a, 'gcx, 'tcx> {
         t
     }
 
-    fn fold_region(&mut self, r: &'tcx ty::Region) -> &'tcx ty::Region {
+    fn fold_region(&mut self, r: ty::Region<'tcx>) -> ty::Region<'tcx> {
         // Note: This routine only handles regions that are bound on
         // type declarations and other outer declarations, not those
         // bound in *fn types*. Region substitution of the bound
@@ -526,7 +538,10 @@ impl<'a, 'gcx, 'tcx> SubstFolder<'a, 'gcx, 'tcx> {
         result
     }
 
-    fn shift_region_through_binders(&self, region: &'tcx ty::Region) -> &'tcx ty::Region {
+    fn shift_region_through_binders(&self, region: ty::Region<'tcx>) -> ty::Region<'tcx> {
+        if self.region_binders_passed == 0 || !region.has_escaping_regions() {
+            return region;
+        }
         self.tcx().mk_region(ty::fold::shift_region(*region, self.region_binders_passed))
     }
 }
@@ -538,12 +553,11 @@ impl<'a, 'gcx, 'tcx> ty::TraitRef<'tcx> {
                        trait_id: DefId,
                        substs: &Substs<'tcx>)
                        -> ty::TraitRef<'tcx> {
-        let defs = tcx.lookup_generics(trait_id);
+        let defs = tcx.generics_of(trait_id);
 
-        let params = substs[..defs.own_count()].iter().cloned();
         ty::TraitRef {
             def_id: trait_id,
-            substs: Substs::new(tcx, params)
+            substs: tcx.intern_substs(&substs[..defs.own_count()])
         }
     }
 }
@@ -555,10 +569,9 @@ impl<'a, 'gcx, 'tcx> ty::ExistentialTraitRef<'tcx> {
         // Assert there is a Self.
         trait_ref.substs.type_at(0);
 
-        let params = trait_ref.substs[1..].iter().cloned();
         ty::ExistentialTraitRef {
             def_id: trait_ref.def_id,
-            substs: Substs::new(tcx, params)
+            substs: tcx.intern_substs(&trait_ref.substs[1..])
         }
     }
 }
@@ -575,11 +588,10 @@ impl<'a, 'gcx, 'tcx> ty::PolyExistentialTraitRef<'tcx> {
         assert!(!self_ty.has_escaping_regions());
 
         self.map_bound(|trait_ref| {
-            let params = trait_ref.substs.iter().cloned();
-            let params = iter::once(Kind::from(self_ty)).chain(params);
             ty::TraitRef {
                 def_id: trait_ref.def_id,
-                substs: Substs::new(tcx, params)
+                substs: tcx.mk_substs(
+                    iter::once(Kind::from(self_ty)).chain(trait_ref.substs.iter().cloned()))
             }
         })
     }

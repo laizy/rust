@@ -68,6 +68,9 @@ macro_rules! panic {
 /// necessary to use `io::stdout().flush()` to ensure the output is emitted
 /// immediately.
 ///
+/// Use `print!` only for the primary output of your program.  Use
+/// `eprint!` instead to print error and progress messages.
+///
 /// # Panics
 ///
 /// Panics if writing to `io::stdout()` fails.
@@ -105,14 +108,17 @@ macro_rules! print {
 /// Use the `format!` syntax to write data to the standard output.
 /// See `std::fmt` for more information.
 ///
+/// Use `println!` only for the primary output of your program.  Use
+/// `eprintln!` instead to print error and progress messages.
+///
 /// # Panics
 ///
-/// Panics if writing to `io::stdout()` fails.
+/// Panics if writing to `io::stdout` fails.
 ///
 /// # Examples
 ///
 /// ```
-/// println!();
+/// println!(); // prints just a newline
 /// println!("hello there!");
 /// println!("format {} arguments", "some");
 /// ```
@@ -122,6 +128,45 @@ macro_rules! println {
     () => (print!("\n"));
     ($fmt:expr) => (print!(concat!($fmt, "\n")));
     ($fmt:expr, $($arg:tt)*) => (print!(concat!($fmt, "\n"), $($arg)*));
+}
+
+/// Macro for printing to the standard error.
+///
+/// Equivalent to the `print!` macro, except that output goes to
+/// `io::stderr` instead of `io::stdout`.  See `print!` for
+/// example usage.
+///
+/// Use `eprint!` only for error and progress messages.  Use `print!`
+/// instead for the primary output of your program.
+///
+/// # Panics
+///
+/// Panics if writing to `io::stderr` fails.
+#[macro_export]
+#[stable(feature = "eprint", since = "1.19.0")]
+#[allow_internal_unstable]
+macro_rules! eprint {
+    ($($arg:tt)*) => ($crate::io::_eprint(format_args!($($arg)*)));
+}
+
+/// Macro for printing to the standard error, with a newline.
+///
+/// Equivalent to the `println!` macro, except that output goes to
+/// `io::stderr` instead of `io::stdout`.  See `println!` for
+/// example usage.
+///
+/// Use `eprintln!` only for error and progress messages.  Use `println!`
+/// instead for the primary output of your program.
+///
+/// # Panics
+///
+/// Panics if writing to `io::stderr` fails.
+#[macro_export]
+#[stable(feature = "eprint", since = "1.19.0")]
+macro_rules! eprintln {
+    () => (eprint!("\n"));
+    ($fmt:expr) => (eprint!(concat!($fmt, "\n")));
+    ($fmt:expr, $($arg:tt)*) => (eprint!(concat!($fmt, "\n"), $($arg)*));
 }
 
 /// A macro to select an event from a number of receivers.
@@ -286,7 +331,7 @@ pub mod builtin {
     /// // fn concat_idents!(new, fun, name) { } // not usable in this way!
     /// # }
     /// ```
-    #[unstable(feature = "concat_idents", issue = "29599")]
+    #[unstable(feature = "concat_idents_macro", issue = "29599")]
     #[macro_export]
     macro_rules! concat_idents {
         ($($e:ident),*) => ({ /* compiler built-in */ })
@@ -381,9 +426,11 @@ pub mod builtin {
 
     /// Includes a utf8-encoded file as a string.
     ///
+    /// The file is located relative to the current file. (similarly to how
+    /// modules are found)
+    ///
     /// This macro will yield an expression of type `&'static str` which is the
-    /// contents of the filename specified. The file is located relative to the
-    /// current file (similarly to how modules are found),
+    /// contents of the file.
     ///
     /// # Examples
     ///
@@ -396,9 +443,11 @@ pub mod builtin {
 
     /// Includes a file as a reference to a byte array.
     ///
+    /// The file is located relative to the current file. (similarly to how
+    /// modules are found)
+    ///
     /// This macro will yield an expression of type `&'static [u8; N]` which is
-    /// the contents of the filename specified. The file is located relative to
-    /// the current file (similarly to how modules are found),
+    /// the contents of the file.
     ///
     /// # Examples
     ///
@@ -437,7 +486,7 @@ pub mod builtin {
     /// leads to less duplicated code.
     ///
     /// The syntax given to this macro is the same syntax as [the `cfg`
-    /// attribute](../reference.html#conditional-compilation).
+    /// attribute](../book/conditional-compilation.html).
     ///
     /// # Examples
     ///
@@ -452,24 +501,40 @@ pub mod builtin {
     #[macro_export]
     macro_rules! cfg { ($($cfg:tt)*) => ({ /* compiler built-in */ }) }
 
-    /// Parse the file provided in the argument as an expression or an
-    /// item according to the context. This file is located relative
-    /// to the current file (similarly to how modules are found).
+    /// Parse a file as an expression or an item according to the context.
+    ///
+    /// The file is located relative to the current file (similarly to how
+    /// modules are found).
     ///
     /// Using this macro is often a bad idea, because if the file is
     /// parsed as an expression, it is going to be placed in the
-    /// surrounding code unhygenically. This could result in variables
+    /// surrounding code unhygienically. This could result in variables
     /// or functions being different from what the file expected if
     /// there are variables or functions that have the same name in
     /// the current file.
     ///
     /// # Examples
     ///
+    /// Assume there are two files in the same directory with the following
+    /// contents:
+    ///
+    /// File 'my_str.in':
+    ///
     /// ```ignore
-    /// fn foo() {
-    ///     include!("/path/to/a/file")
+    /// "Hello World!"
+    /// ```
+    ///
+    /// File 'main.rs':
+    ///
+    /// ```ignore
+    /// fn main() {
+    ///     let my_str = include!("my_str.in");
+    ///     println!("{}", my_str);
     /// }
     /// ```
+    ///
+    /// Compiling 'main.rs' and running the resulting binary will print "Hello
+    /// World!".
     #[stable(feature = "rust1", since = "1.0.0")]
     #[macro_export]
     macro_rules! include { ($file:expr) => ({ /* compiler built-in */ }) }

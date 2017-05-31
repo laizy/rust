@@ -29,12 +29,10 @@
 
 use rustc::ty::TyCtxt;
 use syntax::ast;
-use syntax::parse::token::InternedString;
 
 use {ModuleSource, ModuleTranslation};
 
-const PARTITION_REUSED: &'static str = "rustc_partition_reused";
-const PARTITION_TRANSLATED: &'static str = "rustc_partition_translated";
+use rustc::ich::{ATTR_PARTITION_REUSED, ATTR_PARTITION_TRANSLATED};
 
 const MODULE: &'static str = "module";
 const CFG: &'static str = "cfg";
@@ -42,8 +40,8 @@ const CFG: &'static str = "cfg";
 #[derive(Debug, PartialEq)]
 enum Disposition { Reused, Translated }
 
-pub fn assert_module_sources<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                                       modules: &[ModuleTranslation]) {
+pub(crate) fn assert_module_sources<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                                              modules: &[ModuleTranslation]) {
     let _ignore = tcx.dep_graph.in_ignore();
 
     if tcx.sess.opts.incremental.is_none() {
@@ -51,7 +49,7 @@ pub fn assert_module_sources<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     }
 
     let ams = AssertModuleSource { tcx: tcx, modules: modules };
-    for attr in &tcx.map.krate().attrs {
+    for attr in &tcx.hir.krate().attrs {
         ams.check_attr(attr);
     }
 }
@@ -63,9 +61,9 @@ struct AssertModuleSource<'a, 'tcx: 'a> {
 
 impl<'a, 'tcx> AssertModuleSource<'a, 'tcx> {
     fn check_attr(&self, attr: &ast::Attribute) {
-        let disposition = if attr.check_name(PARTITION_REUSED) {
+        let disposition = if attr.check_name(ATTR_PARTITION_REUSED) {
             Disposition::Reused
-        } else if attr.check_name(PARTITION_TRANSLATED) {
+        } else if attr.check_name(ATTR_PARTITION_TRANSLATED) {
             Disposition::Translated
         } else {
             return;
@@ -77,7 +75,7 @@ impl<'a, 'tcx> AssertModuleSource<'a, 'tcx> {
         }
 
         let mname = self.field(attr, MODULE);
-        let mtrans = self.modules.iter().find(|mtrans| &mtrans.name[..] == &mname[..]);
+        let mtrans = self.modules.iter().find(|mtrans| *mtrans.name == *mname.as_str());
         let mtrans = match mtrans {
             Some(m) => m,
             None => {
@@ -113,8 +111,8 @@ impl<'a, 'tcx> AssertModuleSource<'a, 'tcx> {
         }
     }
 
-    fn field(&self, attr: &ast::Attribute, name: &str) -> InternedString {
-        for item in attr.meta_item_list().unwrap_or(&[]) {
+    fn field(&self, attr: &ast::Attribute, name: &str) -> ast::Name {
+        for item in attr.meta_item_list().unwrap_or_else(Vec::new) {
             if item.check_name(name) {
                 if let Some(value) = item.value_str() {
                     return value;
@@ -134,10 +132,10 @@ impl<'a, 'tcx> AssertModuleSource<'a, 'tcx> {
     /// Scan for a `cfg="foo"` attribute and check whether we have a
     /// cfg flag called `foo`.
     fn check_config(&self, attr: &ast::Attribute) -> bool {
-        let config = &self.tcx.map.krate().config;
+        let config = &self.tcx.sess.parse_sess.config;
         let value = self.field(attr, CFG);
         debug!("check_config(config={:?}, value={:?})", config, value);
-        if config.iter().any(|c| c.check_name(&value[..])) {
+        if config.iter().any(|&(name, _)| name == value) {
             debug!("check_config: matched");
             return true;
         }

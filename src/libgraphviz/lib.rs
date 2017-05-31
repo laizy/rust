@@ -58,7 +58,7 @@
 //! struct Edges(Vec<Ed>);
 //!
 //! pub fn render_to<W: Write>(output: &mut W) {
-//!     let edges = Edges(vec!((0,1), (0,2), (1,3), (2,3), (3,4), (4,4)));
+//!     let edges = Edges(vec![(0,1), (0,2), (1,3), (2,3), (3,4), (4,4)]);
 //!     dot::render(&edges, output).unwrap()
 //! }
 //!
@@ -164,8 +164,8 @@
 //! struct Graph { nodes: Vec<&'static str>, edges: Vec<(usize,usize)> }
 //!
 //! pub fn render_to<W: Write>(output: &mut W) {
-//!     let nodes = vec!("{x,y}","{x}","{y}","{}");
-//!     let edges = vec!((0,1), (0,2), (1,3), (2,3));
+//!     let nodes = vec!["{x,y}","{x}","{y}","{}"];
+//!     let edges = vec![(0,1), (0,2), (1,3), (2,3)];
 //!     let graph = Graph { nodes: nodes, edges: edges };
 //!
 //!     dot::render(&graph, output).unwrap()
@@ -226,8 +226,8 @@
 //! struct Graph { nodes: Vec<&'static str>, edges: Vec<(usize,usize)> }
 //!
 //! pub fn render_to<W: Write>(output: &mut W) {
-//!     let nodes = vec!("{x,y}","{x}","{y}","{}");
-//!     let edges = vec!((0,1), (0,2), (1,3), (2,3));
+//!     let nodes = vec!["{x,y}","{x}","{y}","{}"];
+//!     let edges = vec![(0,1), (0,2), (1,3), (2,3)];
 //!     let graph = Graph { nodes: nodes, edges: edges };
 //!
 //!     dot::render(&graph, output).unwrap()
@@ -284,18 +284,17 @@
 //! * [DOT language](http://www.graphviz.org/doc/info/lang.html)
 
 #![crate_name = "graphviz"]
-#![unstable(feature = "rustc_private", issue = "27812")]
-#![feature(staged_api)]
+#![cfg_attr(stage0, unstable(feature = "rustc_private", issue = "27812"))]
+#![cfg_attr(stage0, feature(staged_api))]
 #![crate_type = "rlib"]
 #![crate_type = "dylib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/",
        test(attr(allow(unused_variables), deny(warnings))))]
-#![cfg_attr(not(stage0), deny(warnings))]
+#![deny(warnings)]
 
 #![feature(str_escape)]
-#![cfg_attr(stage0, feature(question_mark))]
 
 use self::LabelText::*;
 
@@ -555,7 +554,7 @@ impl<'a> LabelText<'a> {
     pub fn to_dot_string(&self) -> String {
         match self {
             &LabelStr(ref s) => format!("\"{}\"", s.escape_default()),
-            &EscStr(ref s) => format!("\"{}\"", LabelText::escape_str(&s[..])),
+            &EscStr(ref s) => format!("\"{}\"", LabelText::escape_str(&s)),
             &HtmlStr(ref s) => format!("<{}>", s),
         }
     }
@@ -588,7 +587,7 @@ impl<'a> LabelText<'a> {
         let mut prefix = self.pre_escaped_content().into_owned();
         let suffix = suffix.pre_escaped_content();
         prefix.push_str(r"\n\n");
-        prefix.push_str(&suffix[..]);
+        prefix.push_str(&suffix);
         EscStr(prefix.into_cow())
     }
 }
@@ -879,7 +878,7 @@ mod tests {
         type Node = Node;
         type Edge = &'a Edge;
         fn graph_id(&'a self) -> Id<'a> {
-            Id::new(&self.name[..]).unwrap()
+            Id::new(self.name).unwrap()
         }
         fn node_id(&'a self, n: &Node) -> Id<'a> {
             id_name(n)

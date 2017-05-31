@@ -27,7 +27,7 @@
 //! created.  See `./README.md` for details.
 
 use hir::def_id::DefId;
-use std::cell::{BorrowState, RefCell};
+use std::cell::RefCell;
 use std::env;
 
 use super::DepNode;
@@ -64,22 +64,29 @@ impl ShadowGraph {
         }
     }
 
+    #[inline]
+    pub fn enabled(&self) -> bool {
+        ENABLED
+    }
+
     pub fn enqueue(&self, message: &DepMessage) {
         if ENABLED {
-            match self.stack.borrow_state() {
-                BorrowState::Unused => {}
-                _ => {
-                    // When we apply edge filters, that invokes the
-                    // Debug trait on DefIds, which in turn reads from
-                    // various bits of state and creates reads! Ignore
-                    // those recursive reads.
-                    return;
-                }
+            if self.stack.try_borrow().is_err() {
+                // When we apply edge filters, that invokes the Debug trait on
+                // DefIds, which in turn reads from various bits of state and
+                // creates reads! Ignore those recursive reads.
+                return;
             }
 
             let mut stack = self.stack.borrow_mut();
             match *message {
-                DepMessage::Read(ref n) => self.check_edge(Some(Some(n)), top(&stack)),
+                // It is ok to READ shared state outside of a
+                // task. That can't do any harm (at least, the only
+                // way it can do harm is by leaking that data into a
+                // query or task, which would be a problem
+                // anyway). What would be bad is WRITING to that
+                // state.
+                DepMessage::Read(_) => { }
                 DepMessage::Write(ref n) => self.check_edge(top(&stack), Some(Some(n))),
                 DepMessage::PushTask(ref n) => stack.push(Some(n.clone())),
                 DepMessage::PushIgnore => stack.push(None),
@@ -115,7 +122,7 @@ impl ShadowGraph {
             (None, None) => unreachable!(),
 
             // nothing on top of the stack
-            (None, Some(n)) | (Some(n), None) => bug!("read/write of {:?} but no current task", n),
+            (None, Some(n)) | (Some(n), None) => bug!("write of {:?} but no current task", n),
 
             // this corresponds to an Ignore being top of the stack
             (Some(None), _) | (_, Some(None)) => (),

@@ -16,13 +16,10 @@ pub use self::Token::*;
 
 use ast::{self};
 use ptr::P;
-use util::interner::Interner;
-use tokenstream;
+use symbol::keywords;
+use tokenstream::TokenTree;
 
-use serialize::{Decodable, Decoder, Encodable, Encoder};
-use std::cell::RefCell;
 use std::fmt;
-use std::ops::Deref;
 use std::rc::Rc;
 
 #[derive(Clone, RustcEncodable, RustcDecodable, PartialEq, Eq, Hash, Debug, Copy)]
@@ -52,18 +49,13 @@ pub enum DelimToken {
     NoDelim,
 }
 
-#[derive(Clone, RustcEncodable, RustcDecodable, PartialEq, Eq, Hash, Debug, Copy)]
-pub enum SpecialMacroVar {
-    /// `$crate` will be filled in with the name of the crate a macro was
-    /// imported from, if any.
-    CrateMacroVar,
-}
+impl DelimToken {
+    pub fn len(self) -> usize {
+        if self == NoDelim { 0 } else { 1 }
+    }
 
-impl SpecialMacroVar {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SpecialMacroVar::CrateMacroVar => "crate",
-        }
+    pub fn is_empty(self) -> bool {
+        self == NoDelim
     }
 }
 
@@ -90,6 +82,44 @@ impl Lit {
             ByteStr(_) | ByteStrRaw(..) => "byte string"
         }
     }
+}
+
+fn ident_can_begin_expr(ident: ast::Ident) -> bool {
+    let ident_token: Token = Ident(ident);
+
+    !ident_token.is_any_keyword() ||
+    ident_token.is_path_segment_keyword() ||
+    [
+        keywords::Do.name(),
+        keywords::Box.name(),
+        keywords::Break.name(),
+        keywords::Continue.name(),
+        keywords::False.name(),
+        keywords::For.name(),
+        keywords::If.name(),
+        keywords::Loop.name(),
+        keywords::Match.name(),
+        keywords::Move.name(),
+        keywords::Return.name(),
+        keywords::True.name(),
+        keywords::Unsafe.name(),
+        keywords::While.name(),
+    ].contains(&ident.name)
+}
+
+fn ident_can_begin_type(ident: ast::Ident) -> bool {
+    let ident_token: Token = Ident(ident);
+
+    !ident_token.is_any_keyword() ||
+    ident_token.is_path_segment_keyword() ||
+    [
+        keywords::For.name(),
+        keywords::Impl.name(),
+        keywords::Fn.name(),
+        keywords::Unsafe.name(),
+        keywords::Extern.name(),
+        keywords::Typeof.name(),
+    ].contains(&ident.name)
 }
 
 #[derive(Clone, RustcEncodable, RustcDecodable, PartialEq, Eq, Hash, Debug)]
@@ -138,18 +168,13 @@ pub enum Token {
     Lifetime(ast::Ident),
 
     /* For interpolation */
-    Interpolated(Nonterminal),
+    Interpolated(Rc<Nonterminal>),
     // Can be expanded into several tokens.
     /// Doc comment
     DocComment(ast::Name),
-    // In left-hand-sides of MBE macros:
-    /// Parse a nonterminal (name to bind, name of NT)
-    MatchNt(ast::Ident, ast::Ident),
     // In right-hand-sides of MBE macros:
     /// A syntactic variable that will be filled in by macro expansion.
     SubstNt(ast::Ident),
-    /// A macro variable with special meaning.
-    SpecialVarNt(SpecialMacroVar),
 
     // Junk. These carry no data because we don't really care about the data
     // they *would* carry, and don't really want to allocate a new ident for
@@ -176,26 +201,47 @@ impl Token {
     /// Returns `true` if the token can appear at the start of an expression.
     pub fn can_begin_expr(&self) -> bool {
         match *self {
-            OpenDelim(_)                => true,
-            Ident(..)                   => true,
-            Underscore                  => true,
-            Tilde                       => true,
-            Literal(..)                 => true,
-            Not                         => true,
-            BinOp(Minus)                => true,
-            BinOp(Star)                 => true,
-            BinOp(And)                  => true,
-            BinOp(Or)                   => true, // in lambda syntax
-            OrOr                        => true, // in lambda syntax
-            AndAnd                      => true, // double borrow
-            DotDot | DotDotDot          => true, // range notation
-            ModSep                      => true,
-            Interpolated(NtExpr(..))    => true,
-            Interpolated(NtIdent(..))   => true,
-            Interpolated(NtBlock(..))   => true,
-            Interpolated(NtPath(..))    => true,
-            Pound                       => true, // for expression attributes
-            _                           => false,
+            Ident(ident)                => ident_can_begin_expr(ident), // value name or keyword
+            OpenDelim(..)               | // tuple, array or block
+            Literal(..)                 | // literal
+            Not                         | // operator not
+            BinOp(Minus)                | // unary minus
+            BinOp(Star)                 | // dereference
+            BinOp(Or) | OrOr            | // closure
+            BinOp(And)                  | // reference
+            AndAnd                      | // double reference
+            DotDot | DotDotDot          | // range notation
+            Lt | BinOp(Shl)             | // associated path
+            ModSep                      | // global path
+            Pound                       => true, // expression attributes
+            Interpolated(ref nt) => match **nt {
+                NtIdent(..) | NtExpr(..) | NtBlock(..) | NtPath(..) => true,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if the token can appear at the start of a type.
+    pub fn can_begin_type(&self) -> bool {
+        match *self {
+            Ident(ident)                => ident_can_begin_type(ident), // type name or keyword
+            OpenDelim(Paren)            | // tuple
+            OpenDelim(Bracket)          | // array
+            Underscore                  | // placeholder
+            Not                         | // never
+            BinOp(Star)                 | // raw pointer
+            BinOp(And)                  | // reference
+            AndAnd                      | // double reference
+            Question                    | // maybe bound in trait object
+            Lifetime(..)                | // lifetime bound in trait object
+            Lt | BinOp(Shl)             | // associated path
+            ModSep                      => true, // global path
+            Interpolated(ref nt) => match **nt {
+                NtIdent(..) | NtTy(..) | NtPath(..) => true,
+                _ => false,
+            },
+            _ => false,
         }
     }
 
@@ -207,12 +253,20 @@ impl Token {
         }
     }
 
+    pub fn ident(&self) -> Option<ast::Ident> {
+        match *self {
+            Ident(ident) => Some(ident),
+            Interpolated(ref nt) => match **nt {
+                NtIdent(ident) => Some(ident.node),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Returns `true` if the token is an identifier.
     pub fn is_ident(&self) -> bool {
-        match *self {
-            Ident(..)   => true,
-            _           => false,
-        }
+        self.ident().is_some()
     }
 
     /// Returns `true` if the token is a documentation comment.
@@ -233,10 +287,12 @@ impl Token {
 
     /// Returns `true` if the token is an interpolated path.
     pub fn is_path(&self) -> bool {
-        match *self {
-            Interpolated(NtPath(..))    => true,
-            _                           => false,
+        if let Interpolated(ref nt) = *self {
+            if let NtPath(..) = **nt {
+                return true;
+            }
         }
+        false
     }
 
     /// Returns `true` if the token is a lifetime.
@@ -253,25 +309,26 @@ impl Token {
         self.is_keyword(keywords::Const)
     }
 
+    pub fn is_qpath_start(&self) -> bool {
+        self == &Lt || self == &BinOp(Shl)
+    }
+
     pub fn is_path_start(&self) -> bool {
-        self == &ModSep || self == &Lt || self.is_path() ||
+        self == &ModSep || self.is_qpath_start() || self.is_path() ||
         self.is_path_segment_keyword() || self.is_ident() && !self.is_any_keyword()
     }
 
     /// Returns `true` if the token is a given keyword, `kw`.
     pub fn is_keyword(&self, kw: keywords::Keyword) -> bool {
-        match *self {
-            Ident(id) => id.name == kw.name(),
-            _ => false,
-        }
+        self.ident().map(|ident| ident.name == kw.name()).unwrap_or(false)
     }
 
     pub fn is_path_segment_keyword(&self) -> bool {
-        match *self {
-            Ident(id) => id.name == keywords::Super.name() ||
-                         id.name == keywords::SelfValue.name() ||
-                         id.name == keywords::SelfType.name(),
-            _ => false,
+        match self.ident() {
+            Some(id) => id.name == keywords::Super.name() ||
+                        id.name == keywords::SelfValue.name() ||
+                        id.name == keywords::SelfType.name(),
+            None => false,
         }
     }
 
@@ -282,18 +339,16 @@ impl Token {
 
     /// Returns `true` if the token is a strict keyword.
     pub fn is_strict_keyword(&self) -> bool {
-        match *self {
-            Ident(id) => id.name >= keywords::As.name() &&
-                         id.name <= keywords::While.name(),
+        match self.ident() {
+            Some(id) => id.name >= keywords::As.name() && id.name <= keywords::While.name(),
             _ => false,
         }
     }
 
     /// Returns `true` if the token is a keyword reserved for possible future use.
     pub fn is_reserved_keyword(&self) -> bool {
-        match *self {
-            Ident(id) => id.name >= keywords::Abstract.name() &&
-                         id.name <= keywords::Yield.name(),
+        match self.ident() {
+            Some(id) => id.name >= keywords::Abstract.name() && id.name <= keywords::Yield.name(),
             _ => false,
         }
     }
@@ -304,19 +359,20 @@ impl Token {
 pub enum Nonterminal {
     NtItem(P<ast::Item>),
     NtBlock(P<ast::Block>),
-    NtStmt(P<ast::Stmt>),
+    NtStmt(ast::Stmt),
     NtPat(P<ast::Pat>),
     NtExpr(P<ast::Expr>),
     NtTy(P<ast::Ty>),
-    NtIdent(Box<ast::SpannedIdent>),
+    NtIdent(ast::SpannedIdent),
     /// Stuff inside brackets for attributes
-    NtMeta(P<ast::MetaItem>),
-    NtPath(Box<ast::Path>),
-    NtTT(P<tokenstream::TokenTree>), // needs P'ed to break a circularity
+    NtMeta(ast::MetaItem),
+    NtPath(ast::Path),
+    NtVis(ast::Visibility),
+    NtTT(TokenTree),
     // These are not exposed to macros, but are used by quasiquote.
     NtArm(ast::Arm),
-    NtImplItem(P<ast::ImplItem>),
-    NtTraitItem(P<ast::TraitItem>),
+    NtImplItem(ast::ImplItem),
+    NtTraitItem(ast::TraitItem),
     NtGenerics(ast::Generics),
     NtWhereClause(ast::WhereClause),
     NtArg(ast::Arg),
@@ -341,273 +397,7 @@ impl fmt::Debug for Nonterminal {
             NtGenerics(..) => f.pad("NtGenerics(..)"),
             NtWhereClause(..) => f.pad("NtWhereClause(..)"),
             NtArg(..) => f.pad("NtArg(..)"),
+            NtVis(..) => f.pad("NtVis(..)"),
         }
     }
-}
-
-// In this macro, there is the requirement that the name (the number) must be monotonically
-// increasing by one in the special identifiers, starting at 0; the same holds for the keywords,
-// except starting from the next number instead of zero.
-macro_rules! declare_keywords {(
-    $( ($index: expr, $konst: ident, $string: expr) )*
-) => {
-    pub mod keywords {
-        use ast;
-        #[derive(Clone, Copy, PartialEq, Eq)]
-        pub struct Keyword {
-            ident: ast::Ident,
-        }
-        impl Keyword {
-            #[inline] pub fn ident(self) -> ast::Ident { self.ident }
-            #[inline] pub fn name(self) -> ast::Name { self.ident.name }
-        }
-        $(
-            #[allow(non_upper_case_globals)]
-            pub const $konst: Keyword = Keyword {
-                ident: ast::Ident::with_empty_ctxt(ast::Name($index))
-            };
-        )*
-    }
-
-    fn mk_fresh_ident_interner() -> IdentInterner {
-        Interner::prefill(&[$($string,)*])
-    }
-}}
-
-// NB: leaving holes in the ident table is bad! a different ident will get
-// interned with the id from the hole, but it will be between the min and max
-// of the reserved words, and thus tagged as "reserved".
-// After modifying this list adjust `is_strict_keyword`/`is_reserved_keyword`,
-// this should be rarely necessary though if the keywords are kept in alphabetic order.
-declare_keywords! {
-    // Invalid identifier
-    (0,  Invalid,        "")
-
-    // Strict keywords used in the language.
-    (1,  As,             "as")
-    (2,  Box,            "box")
-    (3,  Break,          "break")
-    (4,  Const,          "const")
-    (5,  Continue,       "continue")
-    (6,  Crate,          "crate")
-    (7,  Else,           "else")
-    (8,  Enum,           "enum")
-    (9,  Extern,         "extern")
-    (10, False,          "false")
-    (11, Fn,             "fn")
-    (12, For,            "for")
-    (13, If,             "if")
-    (14, Impl,           "impl")
-    (15, In,             "in")
-    (16, Let,            "let")
-    (17, Loop,           "loop")
-    (18, Match,          "match")
-    (19, Mod,            "mod")
-    (20, Move,           "move")
-    (21, Mut,            "mut")
-    (22, Pub,            "pub")
-    (23, Ref,            "ref")
-    (24, Return,         "return")
-    (25, SelfValue,      "self")
-    (26, SelfType,       "Self")
-    (27, Static,         "static")
-    (28, Struct,         "struct")
-    (29, Super,          "super")
-    (30, Trait,          "trait")
-    (31, True,           "true")
-    (32, Type,           "type")
-    (33, Unsafe,         "unsafe")
-    (34, Use,            "use")
-    (35, Where,          "where")
-    (36, While,          "while")
-
-    // Keywords reserved for future use.
-    (37, Abstract,       "abstract")
-    (38, Alignof,        "alignof")
-    (39, Become,         "become")
-    (40, Do,             "do")
-    (41, Final,          "final")
-    (42, Macro,          "macro")
-    (43, Offsetof,       "offsetof")
-    (44, Override,       "override")
-    (45, Priv,           "priv")
-    (46, Proc,           "proc")
-    (47, Pure,           "pure")
-    (48, Sizeof,         "sizeof")
-    (49, Typeof,         "typeof")
-    (50, Unsized,        "unsized")
-    (51, Virtual,        "virtual")
-    (52, Yield,          "yield")
-
-    // Weak keywords, have special meaning only in specific contexts.
-    (53, Default,        "default")
-    (54, StaticLifetime, "'static")
-    (55, Union,          "union")
-}
-
-// looks like we can get rid of this completely...
-pub type IdentInterner = Interner;
-
-// if an interner exists in TLS, return it. Otherwise, prepare a
-// fresh one.
-// FIXME(eddyb) #8726 This should probably use a thread-local reference.
-pub fn with_ident_interner<T, F: FnOnce(&mut IdentInterner) -> T>(f: F) -> T {
-    thread_local!(static KEY: RefCell<IdentInterner> = {
-        RefCell::new(mk_fresh_ident_interner())
-    });
-    KEY.with(|interner| f(&mut *interner.borrow_mut()))
-}
-
-/// Reset the ident interner to its initial state.
-pub fn reset_ident_interner() {
-    with_ident_interner(|interner| *interner = mk_fresh_ident_interner());
-}
-
-pub fn clear_ident_interner() {
-    with_ident_interner(|interner| *interner = IdentInterner::new());
-}
-
-/// Represents a string stored in the thread-local interner. Because the
-/// interner lives for the life of the thread, this can be safely treated as an
-/// immortal string, as long as it never crosses between threads.
-///
-/// FIXME(pcwalton): You must be careful about what you do in the destructors
-/// of objects stored in TLS, because they may run after the interner is
-/// destroyed. In particular, they must not access string contents. This can
-/// be fixed in the future by just leaking all strings until thread death
-/// somehow.
-#[derive(Clone, PartialEq, Hash, PartialOrd, Eq, Ord)]
-pub struct InternedString {
-    string: Rc<str>,
-}
-
-impl InternedString {
-    #[inline]
-    pub fn new(string: &'static str) -> InternedString {
-        InternedString {
-            string: Rc::__from_str(string),
-        }
-    }
-
-    #[inline]
-    pub fn new_from_name(name: ast::Name) -> InternedString {
-        with_ident_interner(|interner| InternedString { string: interner.get(name) })
-    }
-}
-
-impl Deref for InternedString {
-    type Target = str;
-
-    fn deref(&self) -> &str { &self.string }
-}
-
-impl fmt::Debug for InternedString {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Debug::fmt(&self.string, f)
-    }
-}
-
-impl fmt::Display for InternedString {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Display::fmt(&self.string, f)
-    }
-}
-
-impl<'a> PartialEq<&'a str> for InternedString {
-    #[inline(always)]
-    fn eq(&self, other: & &'a str) -> bool {
-        PartialEq::eq(&self.string[..], *other)
-    }
-    #[inline(always)]
-    fn ne(&self, other: & &'a str) -> bool {
-        PartialEq::ne(&self.string[..], *other)
-    }
-}
-
-impl<'a> PartialEq<InternedString> for &'a str {
-    #[inline(always)]
-    fn eq(&self, other: &InternedString) -> bool {
-        PartialEq::eq(*self, &other.string[..])
-    }
-    #[inline(always)]
-    fn ne(&self, other: &InternedString) -> bool {
-        PartialEq::ne(*self, &other.string[..])
-    }
-}
-
-impl PartialEq<str> for InternedString {
-    #[inline(always)]
-    fn eq(&self, other: &str) -> bool {
-        PartialEq::eq(&self.string[..], other)
-    }
-    #[inline(always)]
-    fn ne(&self, other: &str) -> bool {
-        PartialEq::ne(&self.string[..], other)
-    }
-}
-
-impl PartialEq<InternedString> for str {
-    #[inline(always)]
-    fn eq(&self, other: &InternedString) -> bool {
-        PartialEq::eq(self, &other.string[..])
-    }
-    #[inline(always)]
-    fn ne(&self, other: &InternedString) -> bool {
-        PartialEq::ne(self, &other.string[..])
-    }
-}
-
-impl Decodable for InternedString {
-    fn decode<D: Decoder>(d: &mut D) -> Result<InternedString, D::Error> {
-        Ok(intern(&d.read_str()?).as_str())
-    }
-}
-
-impl Encodable for InternedString {
-    fn encode<S: Encoder>(&self, s: &mut S) -> Result<(), S::Error> {
-        s.emit_str(&self.string)
-    }
-}
-
-/// Interns and returns the string contents of an identifier, using the
-/// thread-local interner.
-#[inline]
-pub fn intern_and_get_ident(s: &str) -> InternedString {
-    intern(s).as_str()
-}
-
-/// Maps a string to its interned representation.
-#[inline]
-pub fn intern(s: &str) -> ast::Name {
-    with_ident_interner(|interner| interner.intern(s))
-}
-
-/// gensym's a new usize, using the current interner.
-#[inline]
-pub fn gensym(s: &str) -> ast::Name {
-    with_ident_interner(|interner| interner.gensym(s))
-}
-
-/// Maps a string to an identifier with an empty syntax context.
-#[inline]
-pub fn str_to_ident(s: &str) -> ast::Ident {
-    ast::Ident::with_empty_ctxt(intern(s))
-}
-
-/// Maps a string to a gensym'ed identifier.
-#[inline]
-pub fn gensym_ident(s: &str) -> ast::Ident {
-    ast::Ident::with_empty_ctxt(gensym(s))
-}
-
-// create a fresh name that maps to the same string as the old one.
-// note that this guarantees that str_ptr_eq(ident_to_string(src),interner_get(fresh_name(src)));
-// that is, that the new name and the old one are connected to ptr_eq strings.
-pub fn fresh_name(src: ast::Ident) -> ast::Name {
-    with_ident_interner(|interner| interner.gensym_copy(src.name))
-    // following: debug version. Could work in final except that it's incompatible with
-    // good error messages and uses of struct names in ambiguous could-be-binding
-    // locations. Also definitely destroys the guarantee given above about ptr_eq.
-    /*let num = rand::thread_rng().gen_uint_range(0,0xffff);
-    gensym(format!("{}_{}",ident_to_string(src),num))*/
 }

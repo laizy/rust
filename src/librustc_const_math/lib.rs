@@ -15,20 +15,22 @@
 //! This API is completely unstable and subject to change.
 
 #![crate_name = "rustc_const_math"]
-#![unstable(feature = "rustc_private", issue = "27812")]
 #![crate_type = "dylib"]
 #![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
+#![deny(warnings)]
 
+#![feature(const_fn)]
+#![feature(i128)]
+#![feature(i128_type)]
 
-#![feature(rustc_private)]
-#![feature(staged_api)]
-#![cfg_attr(stage0, feature(question_mark))]
+#![cfg_attr(stage0, unstable(feature = "rustc_private", issue = "27812"))]
+#![cfg_attr(stage0, feature(rustc_private))]
+#![cfg_attr(stage0, feature(staged_api))]
 
-#[macro_use] extern crate log;
-#[macro_use] extern crate syntax;
+extern crate syntax;
 
 extern crate serialize as rustc_serialize; // used by deriving
 

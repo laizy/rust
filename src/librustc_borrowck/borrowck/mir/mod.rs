@@ -11,22 +11,18 @@
 use borrowck::BorrowckCtxt;
 
 use syntax::ast::{self, MetaItem};
-use syntax::ptr::P;
-use syntax_pos::{Span, DUMMY_SP};
+use syntax_pos::DUMMY_SP;
 
-use rustc::hir;
-use rustc::hir::intravisit::{FnKind};
-
-use rustc::mir::repr;
-use rustc::mir::repr::{BasicBlock, BasicBlockData, Mir, Statement, Terminator, Location};
+use rustc::mir::{self, BasicBlock, BasicBlockData, Mir, Statement, Terminator, Location};
 use rustc::session::Session;
 use rustc::ty::{self, TyCtxt};
+use rustc_mir::util::elaborate_drops::DropFlagState;
+use rustc_data_structures::indexed_set::{IdxSet, IdxSetBuf};
 
 mod abs_domain;
 pub mod elaborate_drops;
 mod dataflow;
 mod gather_moves;
-mod patch;
 // mod graphviz;
 
 use self::dataflow::{BitDenotation};
@@ -34,9 +30,11 @@ use self::dataflow::{DataflowOperator};
 use self::dataflow::{Dataflow, DataflowAnalysis, DataflowResults};
 use self::dataflow::{MaybeInitializedLvals, MaybeUninitializedLvals};
 use self::dataflow::{DefinitelyInitializedLvals};
-use self::gather_moves::{MoveData, MovePathIndex, LookupResult};
+use self::gather_moves::{HasMoveData, MoveData, MovePathIndex, LookupResult};
 
-fn has_rustc_mir_with(attrs: &[ast::Attribute], name: &str) -> Option<P<MetaItem>> {
+use std::fmt;
+
+fn has_rustc_mir_with(attrs: &[ast::Attribute], name: &str) -> Option<MetaItem> {
     for attr in attrs {
         if attr.check_name("rustc_mir") {
             let items = attr.meta_item_list();
@@ -53,48 +51,45 @@ fn has_rustc_mir_with(attrs: &[ast::Attribute], name: &str) -> Option<P<MetaItem
 
 pub struct MoveDataParamEnv<'tcx> {
     move_data: MoveData<'tcx>,
-    param_env: ty::ParameterEnvironment<'tcx>,
+    param_env: ty::ParamEnv<'tcx>,
 }
 
-pub fn borrowck_mir<'a, 'tcx: 'a>(
-    bcx: &mut BorrowckCtxt<'a, 'tcx>,
-    fk: FnKind,
-    _decl: &hir::FnDecl,
-    mir: &'a Mir<'tcx>,
-    body: &hir::Block,
-    _sp: Span,
-    id: ast::NodeId,
-    attributes: &[ast::Attribute]) {
-    match fk {
-        FnKind::ItemFn(name, ..) |
-        FnKind::Method(name, ..) => {
-            debug!("borrowck_mir({}) UNIMPLEMENTED", name);
-        }
-        FnKind::Closure(_) => {
-            debug!("borrowck_mir closure (body.id={}) UNIMPLEMENTED", body.id);
-        }
-    }
-
+pub fn borrowck_mir(bcx: &mut BorrowckCtxt,
+                    id: ast::NodeId,
+                    attributes: &[ast::Attribute]) {
     let tcx = bcx.tcx;
+    let def_id = tcx.hir.local_def_id(id);
+    debug!("borrowck_mir({:?}) UNIMPLEMENTED", def_id);
 
-    let param_env = ty::ParameterEnvironment::for_item(tcx, id);
-    let move_data = MoveData::gather_moves(mir, tcx, &param_env);
+    // It is safe for us to borrow `mir_validated()`: `optimized_mir`
+    // steals it, but it forces the `borrowck` query.
+    let mir = &tcx.mir_validated(def_id).borrow();
+
+    let param_env = tcx.param_env(def_id);
+    let move_data = MoveData::gather_moves(mir, tcx, param_env);
     let mdpe = MoveDataParamEnv { move_data: move_data, param_env: param_env };
+    let dead_unwinds = IdxSetBuf::new_empty(mir.basic_blocks().len());
     let flow_inits =
-        do_dataflow(tcx, mir, id, attributes, &mdpe, MaybeInitializedLvals::new(tcx, mir));
+        do_dataflow(tcx, mir, id, attributes, &dead_unwinds,
+                    MaybeInitializedLvals::new(tcx, mir, &mdpe),
+                    |bd, i| &bd.move_data().move_paths[i]);
     let flow_uninits =
-        do_dataflow(tcx, mir, id, attributes, &mdpe, MaybeUninitializedLvals::new(tcx, mir));
+        do_dataflow(tcx, mir, id, attributes, &dead_unwinds,
+                    MaybeUninitializedLvals::new(tcx, mir, &mdpe),
+                    |bd, i| &bd.move_data().move_paths[i]);
     let flow_def_inits =
-        do_dataflow(tcx, mir, id, attributes, &mdpe, DefinitelyInitializedLvals::new(tcx, mir));
+        do_dataflow(tcx, mir, id, attributes, &dead_unwinds,
+                    DefinitelyInitializedLvals::new(tcx, mir, &mdpe),
+                    |bd, i| &bd.move_data().move_paths[i]);
 
     if has_rustc_mir_with(attributes, "rustc_peek_maybe_init").is_some() {
-        dataflow::sanity_check_via_rustc_peek(bcx.tcx, mir, id, attributes, &mdpe, &flow_inits);
+        dataflow::sanity_check_via_rustc_peek(bcx.tcx, mir, id, attributes, &flow_inits);
     }
     if has_rustc_mir_with(attributes, "rustc_peek_maybe_uninit").is_some() {
-        dataflow::sanity_check_via_rustc_peek(bcx.tcx, mir, id, attributes, &mdpe, &flow_uninits);
+        dataflow::sanity_check_via_rustc_peek(bcx.tcx, mir, id, attributes, &flow_uninits);
     }
     if has_rustc_mir_with(attributes, "rustc_peek_definite_init").is_some() {
-        dataflow::sanity_check_via_rustc_peek(bcx.tcx, mir, id, attributes, &mdpe, &flow_def_inits);
+        dataflow::sanity_check_via_rustc_peek(bcx.tcx, mir, id, attributes, &flow_def_inits);
     }
 
     if has_rustc_mir_with(attributes, "stop_after_dataflow").is_some() {
@@ -105,7 +100,7 @@ pub fn borrowck_mir<'a, 'tcx: 'a>(
         bcx: bcx,
         mir: mir,
         node_id: id,
-        move_data: mdpe.move_data,
+        move_data: &mdpe.move_data,
         flow_inits: flow_inits,
         flow_uninits: flow_uninits,
     };
@@ -117,13 +112,16 @@ pub fn borrowck_mir<'a, 'tcx: 'a>(
     debug!("borrowck_mir done");
 }
 
-fn do_dataflow<'a, 'tcx, BD>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                             mir: &Mir<'tcx>,
-                             node_id: ast::NodeId,
-                             attributes: &[ast::Attribute],
-                             ctxt: &BD::Ctxt,
-                             bd: BD) -> DataflowResults<BD>
-    where BD: BitDenotation<Idx=MovePathIndex, Ctxt=MoveDataParamEnv<'tcx>> + DataflowOperator
+fn do_dataflow<'a, 'tcx, BD, P>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                                mir: &Mir<'tcx>,
+                                node_id: ast::NodeId,
+                                attributes: &[ast::Attribute],
+                                dead_unwinds: &IdxSet<BasicBlock>,
+                                bd: BD,
+                                p: P)
+                                -> DataflowResults<BD>
+    where BD: BitDenotation<Idx=MovePathIndex> + DataflowOperator,
+          P: Fn(&BD, BD::Idx) -> &fmt::Debug
 {
     let name_found = |sess: &Session, attrs: &[ast::Attribute], name| -> Option<String> {
         if let Some(item) = has_rustc_mir_with(attrs, name) {
@@ -148,16 +146,15 @@ fn do_dataflow<'a, 'tcx, BD>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         node_id: node_id,
         print_preflow_to: print_preflow_to,
         print_postflow_to: print_postflow_to,
-        flow_state: DataflowAnalysis::new(tcx, mir, ctxt, bd),
+        flow_state: DataflowAnalysis::new(tcx, mir, dead_unwinds, bd),
     };
 
-    mbcx.dataflow(|ctxt, i| &ctxt.move_data.move_paths[i]);
+    mbcx.dataflow(p);
     mbcx.flow_state.results()
 }
 
 
-pub struct MirBorrowckCtxtPreDataflow<'a, 'tcx: 'a, BD>
-    where BD: BitDenotation, BD::Ctxt: 'a
+pub struct MirBorrowckCtxtPreDataflow<'a, 'tcx: 'a, BD> where BD: BitDenotation
 {
     node_id: ast::NodeId,
     flow_state: DataflowAnalysis<'a, 'tcx, BD>,
@@ -170,9 +167,9 @@ pub struct MirBorrowckCtxt<'b, 'a: 'b, 'tcx: 'a> {
     bcx: &'b mut BorrowckCtxt<'a, 'tcx>,
     mir: &'b Mir<'tcx>,
     node_id: ast::NodeId,
-    move_data: MoveData<'tcx>,
-    flow_inits: DataflowResults<MaybeInitializedLvals<'a, 'tcx>>,
-    flow_uninits: DataflowResults<MaybeUninitializedLvals<'a, 'tcx>>
+    move_data: &'b MoveData<'tcx>,
+    flow_inits: DataflowResults<MaybeInitializedLvals<'b, 'tcx>>,
+    flow_uninits: DataflowResults<MaybeUninitializedLvals<'b, 'tcx>>
 }
 
 impl<'b, 'a: 'b, 'tcx: 'a> MirBorrowckCtxt<'b, 'a, 'tcx> {
@@ -195,31 +192,16 @@ impl<'b, 'a: 'b, 'tcx: 'a> MirBorrowckCtxt<'b, 'a, 'tcx> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-enum DropFlagState {
-    Present, // i.e. initialized
-    Absent, // i.e. deinitialized or "moved"
-}
-
-impl DropFlagState {
-    fn value(self) -> bool {
-        match self {
-            DropFlagState::Present => true,
-            DropFlagState::Absent => false
-        }
-    }
-}
-
 fn move_path_children_matching<'tcx, F>(move_data: &MoveData<'tcx>,
                                         path: MovePathIndex,
                                         mut cond: F)
                                         -> Option<MovePathIndex>
-    where F: FnMut(&repr::LvalueProjection<'tcx>) -> bool
+    where F: FnMut(&mir::LvalueProjection<'tcx>) -> bool
 {
     let mut next_child = move_data.move_paths[path].first_child;
     while let Some(child_index) = next_child {
         match move_data.move_paths[child_index].lvalue {
-            repr::Lvalue::Projection(ref proj) => {
+            mir::Lvalue::Projection(ref proj) => {
                 if cond(proj) {
                     return Some(child_index)
                 }
@@ -252,7 +234,7 @@ fn move_path_children_matching<'tcx, F>(move_data: &MoveData<'tcx>,
 /// FIXME: we have to do something for moving slice patterns.
 fn lvalue_contents_drop_state_cannot_differ<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                                                       mir: &Mir<'tcx>,
-                                                      lv: &repr::Lvalue<'tcx>) -> bool {
+                                                      lv: &mir::Lvalue<'tcx>) -> bool {
     let ty = lv.ty(mir, tcx).to_ty(tcx);
     match ty.sty {
         ty::TyArray(..) | ty::TySlice(..) | ty::TyRef(..) | ty::TyRawPtr(..) => {
@@ -260,7 +242,7 @@ fn lvalue_contents_drop_state_cannot_differ<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx
                    lv, ty);
             true
         }
-        ty::TyAdt(def, _) if def.has_dtor() || def.is_union() => {
+        ty::TyAdt(def, _) if (def.has_dtor(tcx) && !def.is_box()) || def.is_union() => {
             debug!("lvalue_contents_drop_state_cannot_differ lv: {:?} ty: {:?} Drop => true",
                    lv, ty);
             true
@@ -330,6 +312,27 @@ fn on_all_children_bits<'a, 'tcx, F>(
     on_all_children_bits(tcx, mir, move_data, move_path_index, &mut each_child);
 }
 
+fn on_all_drop_children_bits<'a, 'tcx, F>(
+    tcx: TyCtxt<'a, 'tcx, 'tcx>,
+    mir: &Mir<'tcx>,
+    ctxt: &MoveDataParamEnv<'tcx>,
+    path: MovePathIndex,
+    mut each_child: F)
+    where F: FnMut(MovePathIndex)
+{
+    on_all_children_bits(tcx, mir, &ctxt.move_data, path, |child| {
+        let lvalue = &ctxt.move_data.move_paths[path].lvalue;
+        let ty = lvalue.ty(mir, tcx).to_ty(tcx);
+        debug!("on_all_drop_children_bits({:?}, {:?} : {:?})", path, lvalue, ty);
+
+        if ty.needs_drop(tcx, ctxt.param_env) {
+            each_child(child);
+        } else {
+            debug!("on_all_drop_children_bits - skipping")
+        }
+    })
+}
+
 fn drop_flag_effects_for_function_entry<'a, 'tcx, F>(
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
     mir: &Mir<'tcx>,
@@ -339,7 +342,7 @@ fn drop_flag_effects_for_function_entry<'a, 'tcx, F>(
 {
     let move_data = &ctxt.move_data;
     for arg in mir.args_iter() {
-        let lvalue = repr::Lvalue::Local(arg);
+        let lvalue = mir::Lvalue::Local(arg);
         let lookup_result = move_data.rev_lookup.find(&lvalue);
         on_lookup_result_bits(tcx, mir, move_data,
                               lookup_result,
@@ -356,7 +359,7 @@ fn drop_flag_effects_for_location<'a, 'tcx, F>(
     where F: FnMut(MovePathIndex, DropFlagState)
 {
     let move_data = &ctxt.move_data;
-    let param_env = &ctxt.param_env;
+    let param_env = ctxt.param_env;
     debug!("drop_flag_effects_for_location({:?})", loc);
 
     // first, move out of the RHS
@@ -379,23 +382,24 @@ fn drop_flag_effects_for_location<'a, 'tcx, F>(
     let block = &mir[loc.block];
     match block.statements.get(loc.statement_index) {
         Some(stmt) => match stmt.kind {
-            repr::StatementKind::SetDiscriminant{ .. } => {
+            mir::StatementKind::SetDiscriminant{ .. } => {
                 span_bug!(stmt.source_info.span, "SetDiscrimant should not exist during borrowck");
             }
-            repr::StatementKind::Assign(ref lvalue, _) => {
+            mir::StatementKind::Assign(ref lvalue, _) => {
                 debug!("drop_flag_effects: assignment {:?}", stmt);
                  on_lookup_result_bits(tcx, mir, move_data,
                                        move_data.rev_lookup.find(lvalue),
                                        |moi| callback(moi, DropFlagState::Present))
             }
-            repr::StatementKind::StorageLive(_) |
-            repr::StatementKind::StorageDead(_) |
-            repr::StatementKind::Nop => {}
+            mir::StatementKind::StorageLive(_) |
+            mir::StatementKind::StorageDead(_) |
+            mir::StatementKind::InlineAsm { .. } |
+            mir::StatementKind::Nop => {}
         },
         None => {
             debug!("drop_flag_effects: replace {:?}", block.terminator());
             match block.terminator().kind {
-                repr::TerminatorKind::DropAndReplace { ref location, .. } => {
+                mir::TerminatorKind::DropAndReplace { ref location, .. } => {
                     on_lookup_result_bits(tcx, mir, move_data,
                                           move_data.rev_lookup.find(location),
                                           |moi| callback(moi, DropFlagState::Present))

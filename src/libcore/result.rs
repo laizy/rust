@@ -139,7 +139,7 @@
 //! assert!(file.write_all(b"important message").is_ok());
 //! ```
 //!
-//! Or propagate the error up the call stack with [`try!`]:
+//! Or propagate the error up the call stack with [`?`]:
 //!
 //! ```
 //! # use std::fs::File;
@@ -147,17 +147,17 @@
 //! # use std::io;
 //! # #[allow(dead_code)]
 //! fn write_message() -> io::Result<()> {
-//!     let mut file = try!(File::create("valuable_data.txt"));
-//!     try!(file.write_all(b"important message"));
+//!     let mut file = File::create("valuable_data.txt")?;
+//!     file.write_all(b"important message")?;
 //!     Ok(())
 //! }
 //! ```
 //!
-//! # The `try!` macro
+//! # The `?` syntax
 //!
 //! When writing code that calls many functions that return the
-//! [`Result`] type, the error handling can be tedious. The [`try!`]
-//! macro hides some of the boilerplate of propagating errors up the
+//! [`Result`] type, the error handling can be tedious. The [`?`]
+//! syntax hides some of the boilerplate of propagating errors up the
 //! call stack.
 //!
 //! It replaces this:
@@ -208,37 +208,29 @@
 //! }
 //!
 //! fn write_info(info: &Info) -> io::Result<()> {
-//!     let mut file = try!(File::create("my_best_friends.txt"));
+//!     let mut file = File::create("my_best_friends.txt")?;
 //!     // Early return on error
-//!     try!(file.write_all(format!("name: {}\n", info.name).as_bytes()));
-//!     try!(file.write_all(format!("age: {}\n", info.age).as_bytes()));
-//!     try!(file.write_all(format!("rating: {}\n", info.rating).as_bytes()));
+//!     file.write_all(format!("name: {}\n", info.name).as_bytes())?;
+//!     file.write_all(format!("age: {}\n", info.age).as_bytes())?;
+//!     file.write_all(format!("rating: {}\n", info.rating).as_bytes())?;
 //!     Ok(())
 //! }
 //! ```
 //!
 //! *It's much nicer!*
 //!
-//! Wrapping an expression in [`try!`] will result in the unwrapped
+//! Ending the expression with [`?`] will result in the unwrapped
 //! success ([`Ok`]) value, unless the result is [`Err`], in which case
-//! [`Err`] is returned early from the enclosing function. Its simple definition
-//! makes it clear:
+//! [`Err`] is returned early from the enclosing function.
 //!
-//! ```
-//! macro_rules! try {
-//!     ($e:expr) => (match $e { Ok(e) => e, Err(e) => return Err(e) })
-//! }
-//! ```
-//!
-//! [`try!`] is imported by the prelude and is available everywhere, but it can only
-//! be used in functions that return [`Result`] because of the early return of
-//! [`Err`] that it provides.
+//! [`?`] can only be used in functions that return [`Result`] because of the
+//! early return of [`Err`] that it provides.
 //!
 //! [`expect`]: enum.Result.html#method.expect
 //! [`Write`]: ../../std/io/trait.Write.html
 //! [`write_all`]: ../../std/io/trait.Write.html#method.write_all
 //! [`io::Result`]: ../../std/io/type.Result.html
-//! [`try!`]: ../../std/macro.try.html
+//! [`?`]: ../../std/macro.try.html
 //! [`Result`]: enum.Result.html
 //! [`Ok(T)`]: enum.Result.html#variant.Ok
 //! [`Err(E)`]: enum.Result.html#variant.Err
@@ -249,7 +241,7 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use fmt;
-use iter::{FromIterator, FusedIterator};
+use iter::{FromIterator, FusedIterator, TrustedLen};
 
 /// `Result` is a type that represents either success (`Ok`) or failure (`Err`).
 ///
@@ -276,7 +268,7 @@ impl<T, E> Result<T, E> {
     // Querying the contained values
     /////////////////////////////////////////////////////////////////////////
 
-    /// Returns true if the result is `Ok`.
+    /// Returns `true` if the result is `Ok`.
     ///
     /// # Examples
     ///
@@ -298,7 +290,7 @@ impl<T, E> Result<T, E> {
         }
     }
 
-    /// Returns true if the result is `Err`.
+    /// Returns `true` if the result is `Err`.
     ///
     /// # Examples
     ///
@@ -501,6 +493,8 @@ impl<T, E> Result<T, E> {
 
     /// Returns an iterator over the possibly contained value.
     ///
+    /// The iterator yields one value if the result is [`Ok`], otherwise none.
+    ///
     /// # Examples
     ///
     /// Basic usage:
@@ -512,6 +506,8 @@ impl<T, E> Result<T, E> {
     /// let x: Result<u32, &str> = Err("nothing!");
     /// assert_eq!(x.iter().next(), None);
     /// ```
+    ///
+    /// [`Ok`]: enum.Result.html#variant.Ok
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn iter(&self) -> Iter<T> {
@@ -519,6 +515,8 @@ impl<T, E> Result<T, E> {
     }
 
     /// Returns a mutable iterator over the possibly contained value.
+    ///
+    /// The iterator yields one value if the result is [`Ok`], otherwise none.
     ///
     /// # Examples
     ///
@@ -535,6 +533,8 @@ impl<T, E> Result<T, E> {
     /// let mut x: Result<u32, &str> = Err("nothing!");
     /// assert_eq!(x.iter_mut().next(), None);
     /// ```
+    ///
+    /// [`Ok`]: enum.Result.html#variant.Ok
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn iter_mut(&mut self) -> IterMut<T> {
@@ -790,6 +790,66 @@ impl<T: fmt::Debug, E> Result<T, E> {
             Err(e) => e,
         }
     }
+
+    /// Unwraps a result, yielding the content of an `Err`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value is an `Ok`, with a panic message including the
+    /// passed message, and the content of the `Ok`.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```{.should_panic}
+    /// let x: Result<u32, &str> = Ok(10);
+    /// x.expect_err("Testing expect_err"); // panics with `Testing expect_err: 10`
+    /// ```
+    #[inline]
+    #[stable(feature = "result_expect_err", since = "1.17.0")]
+    pub fn expect_err(self, msg: &str) -> E {
+        match self {
+            Ok(t) => unwrap_failed(msg, t),
+            Err(e) => e,
+        }
+    }
+}
+
+impl<T: Default, E> Result<T, E> {
+    /// Returns the contained value or a default
+    ///
+    /// Consumes the `self` argument then, if `Ok`, returns the contained
+    /// value, otherwise if `Err`, returns the default value for that
+    /// type.
+    ///
+    /// # Examples
+    ///
+    /// Convert a string to an integer, turning poorly-formed strings
+    /// into 0 (the default value for integers). [`parse`] converts
+    /// a string to any other type that implements [`FromStr`], returning an
+    /// `Err` on error.
+    ///
+    /// ```
+    /// let good_year_from_input = "1909";
+    /// let bad_year_from_input = "190blarg";
+    /// let good_year = good_year_from_input.parse().unwrap_or_default();
+    /// let bad_year = bad_year_from_input.parse().unwrap_or_default();
+    ///
+    /// assert_eq!(1909, good_year);
+    /// assert_eq!(0, bad_year);
+    /// ```
+    ///
+    /// [`parse`]: ../../std/primitive.str.html#method.parse
+    /// [`FromStr`]: ../../std/str/trait.FromStr.html
+    #[inline]
+    #[stable(feature = "result_unwrap_or_default", since = "1.16.0")]
+    pub fn unwrap_or_default(self) -> T {
+        match self {
+            Ok(x) => x,
+            Err(_) => Default::default(),
+        }
+    }
 }
 
 // This is a separate function to reduce the code size of the methods
@@ -810,6 +870,8 @@ impl<T, E> IntoIterator for Result<T, E> {
 
     /// Returns a consuming iterator over the possibly contained value.
     ///
+    /// The iterator yields one value if the result is [`Ok`], otherwise none.
+    ///
     /// # Examples
     ///
     /// Basic usage:
@@ -823,6 +885,8 @@ impl<T, E> IntoIterator for Result<T, E> {
     /// let v: Vec<u32> = x.into_iter().collect();
     /// assert_eq!(v, []);
     /// ```
+    ///
+    /// [`Ok`]: enum.Result.html#variant.Ok
     #[inline]
     fn into_iter(self) -> IntoIter<T> {
         IntoIter { inner: self.ok() }
@@ -855,8 +919,13 @@ impl<'a, T, E> IntoIterator for &'a mut Result<T, E> {
 
 /// An iterator over a reference to the [`Ok`] variant of a [`Result`].
 ///
+/// The iterator yields one value if the result is [`Ok`], otherwise none.
+///
+/// Created by [`Result::iter`].
+///
 /// [`Ok`]: enum.Result.html#variant.Ok
 /// [`Result`]: enum.Result.html
+/// [`Result::iter`]: enum.Result.html#method.iter
 #[derive(Debug)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Iter<'a, T: 'a> { inner: Option<&'a T> }
@@ -886,6 +955,9 @@ impl<'a, T> ExactSizeIterator for Iter<'a, T> {}
 #[unstable(feature = "fused", issue = "35602")]
 impl<'a, T> FusedIterator for Iter<'a, T> {}
 
+#[unstable(feature = "trusted_len", issue = "37572")]
+unsafe impl<'a, A> TrustedLen for Iter<'a, A> {}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a, T> Clone for Iter<'a, T> {
     fn clone(&self) -> Iter<'a, T> { Iter { inner: self.inner } }
@@ -893,8 +965,11 @@ impl<'a, T> Clone for Iter<'a, T> {
 
 /// An iterator over a mutable reference to the [`Ok`] variant of a [`Result`].
 ///
+/// Created by [`Result::iter_mut`].
+///
 /// [`Ok`]: enum.Result.html#variant.Ok
 /// [`Result`]: enum.Result.html
+/// [`Result::iter_mut`]: enum.Result.html#method.iter_mut
 #[derive(Debug)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct IterMut<'a, T: 'a> { inner: Option<&'a mut T> }
@@ -924,9 +999,15 @@ impl<'a, T> ExactSizeIterator for IterMut<'a, T> {}
 #[unstable(feature = "fused", issue = "35602")]
 impl<'a, T> FusedIterator for IterMut<'a, T> {}
 
-/// An iterator over the value in a [`Ok`] variant of a [`Result`]. This struct is
-/// created by the [`into_iter`] method on [`Result`][`Result`] (provided by
-/// the [`IntoIterator`] trait).
+#[unstable(feature = "trusted_len", issue = "37572")]
+unsafe impl<'a, A> TrustedLen for IterMut<'a, A> {}
+
+/// An iterator over the value in a [`Ok`] variant of a [`Result`].
+///
+/// The iterator yields one value if the result is [`Ok`], otherwise none.
+///
+/// This struct is created by the [`into_iter`] method on
+/// [`Result`][`Result`] (provided by the [`IntoIterator`] trait).
 ///
 /// [`Ok`]: enum.Result.html#variant.Ok
 /// [`Result`]: enum.Result.html
@@ -961,6 +1042,9 @@ impl<T> ExactSizeIterator for IntoIter<T> {}
 #[unstable(feature = "fused", issue = "35602")]
 impl<T> FusedIterator for IntoIter<T> {}
 
+#[unstable(feature = "trusted_len", issue = "37572")]
+unsafe impl<A> TrustedLen for IntoIter<A> {}
+
 /////////////////////////////////////////////////////////////////////////////
 // FromIterator
 /////////////////////////////////////////////////////////////////////////////
@@ -977,12 +1061,12 @@ impl<A, E, V: FromIterator<A>> FromIterator<Result<A, E>> for Result<V, E> {
     /// ```
     /// use std::u32;
     ///
-    /// let v = vec!(1, 2);
+    /// let v = vec![1, 2];
     /// let res: Result<Vec<u32>, &'static str> = v.iter().map(|&x: &u32|
     ///     if x == u32::MAX { Err("Overflow!") }
     ///     else { Ok(x + 1) }
     /// ).collect();
-    /// assert!(res == Ok(vec!(2, 3)));
+    /// assert!(res == Ok(vec![2, 3]));
     /// ```
     #[inline]
     fn from_iter<I: IntoIterator<Item=Result<A, E>>>(iter: I) -> Result<V, E> {
@@ -1007,6 +1091,11 @@ impl<A, E, V: FromIterator<A>> FromIterator<Result<A, E>> for Result<V, E> {
                     }
                     None => None,
                 }
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                let (_min, max) = self.iter.size_hint();
+                (0, max)
             }
         }
 

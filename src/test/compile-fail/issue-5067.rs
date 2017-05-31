@@ -8,6 +8,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+#![allow(unused_macros)]
+
 macro_rules! foo {
     ( $()* ) => {};
     //~^ ERROR repetition matches empty token tree
@@ -48,7 +50,7 @@ macro_rules! make_vec {
 }
 
 fn main() {
-    let _ = make_vec!(a 1, a 2, a 3);
+    let _ = make_vec![a 1, a 2, a 3];
 }
 
 

@@ -17,28 +17,23 @@ use plugins;
 use fold::{self, DocFolder};
 
 pub fn unindent_comments(krate: clean::Crate) -> plugins::PluginResult {
-    let mut cleaner = CommentCleaner;
-    let krate = cleaner.fold_crate(krate);
-    krate
+    CommentCleaner.fold_crate(krate)
 }
 
 struct CommentCleaner;
 
 impl fold::DocFolder for CommentCleaner {
     fn fold_item(&mut self, mut i: Item) -> Option<Item> {
-        let mut avec: Vec<clean::Attribute> = Vec::new();
-        for attr in &i.attrs {
-            match attr {
-                &clean::NameValue(ref x, ref s)
-                        if "doc" == *x => {
-                    avec.push(clean::NameValue("doc".to_string(),
-                                               unindent(s)))
-                }
-                x => avec.push(x.clone())
-            }
-        }
-        i.attrs = avec;
+        i.attrs.unindent_doc_comments();
         self.fold_item_recur(i)
+    }
+}
+
+impl clean::Attributes {
+    pub fn unindent_doc_comments(&mut self) {
+        for doc_string in &mut self.doc_strings {
+            *doc_string = unindent(doc_string);
+        }
     }
 }
 
@@ -87,7 +82,7 @@ fn unindent(s: &str) -> String {
     });
 
     if !lines.is_empty() {
-        let mut unindented = vec![ lines[0].trim().to_string() ];
+        let mut unindented = vec![ lines[0].trim_left().to_string() ];
         unindented.extend_from_slice(&lines[1..].iter().map(|&line| {
             if line.chars().all(|c| c.is_whitespace()) {
                 line.to_string()
@@ -164,5 +159,16 @@ mod unindent_tests {
         let s = "    \tline1\n    \tline2".to_string();
         let r = unindent(&s);
         assert_eq!(r, "line1\nline2");
+    }
+
+    #[test]
+    fn should_not_trim() {
+        let s = "\t    line1  \n\t    line2".to_string();
+        let r = unindent(&s);
+        assert_eq!(r, "line1  \nline2");
+
+        let s = "    \tline1  \n    \tline2".to_string();
+        let r = unindent(&s);
+        assert_eq!(r, "line1  \nline2");
     }
 }

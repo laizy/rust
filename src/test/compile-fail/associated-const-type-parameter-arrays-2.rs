@@ -25,8 +25,8 @@ impl Foo for Def {
 }
 
 pub fn test<A: Foo, B: Foo>() {
-    let _array = [4; <A as Foo>::Y]; //~ ERROR E0080
-                                     //~| non-constant path in constant
+    let _array = [4; <A as Foo>::Y];
+    //~^ ERROR the trait bound `A: Foo` is not satisfied [E0277]
 }
 
 fn main() {

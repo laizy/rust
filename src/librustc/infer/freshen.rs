@@ -32,7 +32,7 @@
 
 use ty::{self, Ty, TyCtxt, TypeFoldable};
 use ty::fold::TypeFolder;
-use util::nodemap::FnvHashMap;
+use util::nodemap::FxHashMap;
 use std::collections::hash_map::Entry;
 
 use super::InferCtxt;
@@ -41,7 +41,7 @@ use super::unify_key::ToType;
 pub struct TypeFreshener<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
     infcx: &'a InferCtxt<'a, 'gcx, 'tcx>,
     freshen_count: u32,
-    freshen_map: FnvHashMap<ty::InferTy, Ty<'tcx>>,
+    freshen_map: FxHashMap<ty::InferTy, Ty<'tcx>>,
 }
 
 impl<'a, 'gcx, 'tcx> TypeFreshener<'a, 'gcx, 'tcx> {
@@ -50,7 +50,7 @@ impl<'a, 'gcx, 'tcx> TypeFreshener<'a, 'gcx, 'tcx> {
         TypeFreshener {
             infcx: infcx,
             freshen_count: 0,
-            freshen_map: FnvHashMap(),
+            freshen_map: FxHashMap(),
         }
     }
 
@@ -61,9 +61,8 @@ impl<'a, 'gcx, 'tcx> TypeFreshener<'a, 'gcx, 'tcx> {
                   -> Ty<'tcx> where
         F: FnOnce(u32) -> ty::InferTy,
     {
-        match opt_ty {
-            Some(ty) => { return ty.fold_with(self); }
-            None => { }
+        if let Some(ty) = opt_ty {
+            return ty.fold_with(self);
         }
 
         match self.freshen_map.entry(key) {
@@ -84,15 +83,15 @@ impl<'a, 'gcx, 'tcx> TypeFolder<'gcx, 'tcx> for TypeFreshener<'a, 'gcx, 'tcx> {
         self.infcx.tcx
     }
 
-    fn fold_region(&mut self, r: &'tcx ty::Region) -> &'tcx ty::Region {
+    fn fold_region(&mut self, r: ty::Region<'tcx>) -> ty::Region<'tcx> {
         match *r {
-            ty::ReEarlyBound(..) |
             ty::ReLateBound(..) => {
                 // leave bound regions alone
                 r
             }
 
             ty::ReStatic |
+            ty::ReEarlyBound(..) |
             ty::ReFree(_) |
             ty::ReScope(_) |
             ty::ReVar(_) |
@@ -100,7 +99,7 @@ impl<'a, 'gcx, 'tcx> TypeFolder<'gcx, 'tcx> for TypeFreshener<'a, 'gcx, 'tcx> {
             ty::ReEmpty |
             ty::ReErased => {
                 // replace all free regions with 'erased
-                self.tcx().mk_region(ty::ReErased)
+                self.tcx().types.re_erased
             }
         }
     }
@@ -157,7 +156,6 @@ impl<'a, 'gcx, 'tcx> TypeFolder<'gcx, 'tcx> for TypeFreshener<'a, 'gcx, 'tcx> {
             ty::TyUint(..) |
             ty::TyFloat(..) |
             ty::TyAdt(..) |
-            ty::TyBox(..) |
             ty::TyStr |
             ty::TyError |
             ty::TyArray(..) |
@@ -166,7 +164,7 @@ impl<'a, 'gcx, 'tcx> TypeFolder<'gcx, 'tcx> for TypeFreshener<'a, 'gcx, 'tcx> {
             ty::TyRef(..) |
             ty::TyFnDef(..) |
             ty::TyFnPtr(_) |
-            ty::TyTrait(..) |
+            ty::TyDynamic(..) |
             ty::TyClosure(..) |
             ty::TyNever |
             ty::TyTuple(..) |

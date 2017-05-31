@@ -54,6 +54,7 @@ pub struct Command {
     args: Vec<OsString>,
     env: Option<HashMap<OsString, OsString>>,
     cwd: Option<OsString>,
+    flags: u32,
     detach: bool, // not currently exposed in std::process
     stdin: Option<Stdio>,
     stdout: Option<Stdio>,
@@ -84,6 +85,7 @@ impl Command {
             args: Vec::new(),
             env: None,
             cwd: None,
+            flags: 0,
             detach: false,
             stdin: None,
             stdout: None,
@@ -124,6 +126,9 @@ impl Command {
     pub fn stderr(&mut self, stderr: Stdio) {
         self.stderr = Some(stderr);
     }
+    pub fn creation_flags(&mut self, flags: u32) {
+        self.flags = flags;
+    }
 
     pub fn spawn(&mut self, default: Stdio, needs_stdin: bool)
                  -> io::Result<(Process, StdioPipes)> {
@@ -157,7 +162,7 @@ impl Command {
         cmd_str.push(0); // add null terminator
 
         // stolen from the libuv code.
-        let mut flags = c::CREATE_UNICODE_ENVIRONMENT;
+        let mut flags = self.flags | c::CREATE_UNICODE_ENVIRONMENT;
         if self.detach {
             flags |= c::DETACHED_PROCESS | c::CREATE_NEW_PROCESS_GROUP;
         }
@@ -252,26 +257,27 @@ impl Stdio {
             // INVALID_HANDLE_VALUE.
             Stdio::Inherit => {
                 match stdio::get(stdio_id) {
-                    Ok(io) => io.handle().duplicate(0, true,
-                                                    c::DUPLICATE_SAME_ACCESS),
+                    Ok(io) => {
+                        let io = Handle::new(io.handle());
+                        let ret = io.duplicate(0, true,
+                                               c::DUPLICATE_SAME_ACCESS);
+                        io.into_raw();
+                        return ret
+                    }
                     Err(..) => Ok(Handle::new(c::INVALID_HANDLE_VALUE)),
                 }
             }
 
             Stdio::MakePipe => {
-                let (reader, writer) = pipe::anon_pipe()?;
-                let (ours, theirs) = if stdio_id == c::STD_INPUT_HANDLE {
-                    (writer, reader)
-                } else {
-                    (reader, writer)
-                };
-                *pipe = Some(ours);
+                let ours_readable = stdio_id != c::STD_INPUT_HANDLE;
+                let pipes = pipe::anon_pipe(ours_readable)?;
+                *pipe = Some(pipes.ours);
                 cvt(unsafe {
-                    c::SetHandleInformation(theirs.handle().raw(),
+                    c::SetHandleInformation(pipes.theirs.handle().raw(),
                                             c::HANDLE_FLAG_INHERIT,
                                             c::HANDLE_FLAG_INHERIT)
                 })?;
-                Ok(theirs.into_handle())
+                Ok(pipes.theirs.into_handle())
             }
 
             Stdio::Handle(ref handle) => {
@@ -336,6 +342,21 @@ impl Process {
             let mut status = 0;
             cvt(c::GetExitCodeProcess(self.handle.raw(), &mut status))?;
             Ok(ExitStatus(status))
+        }
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        unsafe {
+            match c::WaitForSingleObject(self.handle.raw(), 0) {
+                c::WAIT_OBJECT_0 => {}
+                c::WAIT_TIMEOUT => {
+                    return Ok(None);
+                }
+                _ => return Err(io::Error::last_os_error()),
+            }
+            let mut status = 0;
+            cvt(c::GetExitCodeProcess(self.handle.raw(), &mut status))?;
+            Ok(Some(ExitStatus(status)))
         }
     }
 

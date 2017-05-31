@@ -20,19 +20,20 @@
 extern crate libc;
 extern crate test;
 extern crate getopts;
-extern crate serialize as rustc_serialize;
-
+extern crate rustc_serialize;
 #[macro_use]
 extern crate log;
-
-#[cfg(cargobuild)]
 extern crate env_logger;
+extern crate filetime;
+extern crate diff;
 
 use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use filetime::FileTime;
 use getopts::{optopt, optflag, reqopt};
 use common::Config;
 use common::{Pretty, DebugInfoGdb, DebugInfoLldb, Mode};
@@ -49,14 +50,9 @@ pub mod runtest;
 pub mod common;
 pub mod errors;
 mod raise_fd_limit;
-mod uidiff;
 
 fn main() {
-    #[cfg(cargobuild)]
-    fn log_init() { env_logger::init().unwrap(); }
-    #[cfg(not(cargobuild))]
-    fn log_init() {}
-    log_init();
+    env_logger::init().unwrap();
 
     let config = parse_config(env::args().collect());
 
@@ -71,7 +67,7 @@ fn main() {
 pub fn parse_config(args: Vec<String> ) -> Config {
 
     let groups : Vec<getopts::OptGroup> =
-        vec!(reqopt("", "compile-lib-path", "path to host shared libraries", "PATH"),
+        vec![reqopt("", "compile-lib-path", "path to host shared libraries", "PATH"),
           reqopt("", "run-lib-path", "path to target shared libraries", "PATH"),
           reqopt("", "rustc-path", "path to rustc to use for compiling", "PATH"),
           reqopt("", "rustdoc-path", "path to rustdoc to use for compiling", "PATH"),
@@ -87,6 +83,7 @@ pub fn parse_config(args: Vec<String> ) -> Config {
                  "(compile-fail|parse-fail|run-fail|run-pass|\
                   run-pass-valgrind|pretty|debug-info|incremental|mir-opt)"),
           optflag("", "ignored", "run tests marked as ignored"),
+          optflag("", "exact", "filters match exactly"),
           optopt("", "runtool", "supervisor program to run tests under \
                                  (eg. emulator, valgrind)", "PROGRAM"),
           optopt("", "host-rustcflags", "flags to pass to rustc for host", "FLAGS"),
@@ -96,7 +93,7 @@ pub fn parse_config(args: Vec<String> ) -> Config {
           optopt("", "logfile", "file to log test execution to", "FILE"),
           optopt("", "target", "the target to build for", "TARGET"),
           optopt("", "host", "the host to build for", "HOST"),
-          optopt("", "gdb-version", "the version of GDB used", "VERSION STRING"),
+          optopt("", "gdb", "path to GDB to use for GDB debuginfo tests", "PATH"),
           optopt("", "lldb-version", "the version of LLDB used", "VERSION STRING"),
           optopt("", "llvm-version", "the version of LLVM used", "VERSION STRING"),
           optopt("", "android-cross-path", "Android NDK standalone path", "PATH"),
@@ -109,7 +106,8 @@ pub fn parse_config(args: Vec<String> ) -> Config {
           reqopt("", "llvm-components", "list of LLVM components built in", "LIST"),
           reqopt("", "llvm-cxxflags", "C++ flags for LLVM", "FLAGS"),
           optopt("", "nodejs", "the name of nodejs", "PATH"),
-          optflag("h", "help", "show this message"));
+          optopt("", "remote-test-client", "path to the remote test client", "PATH"),
+          optflag("h", "help", "show this message")];
 
     let (argv0, args_) = args.split_first().unwrap();
     if args.len() == 1 || args[1] == "-h" || args[1] == "--help" {
@@ -147,6 +145,8 @@ pub fn parse_config(args: Vec<String> ) -> Config {
         }
     }
 
+    let (gdb, gdb_version, gdb_native_rust) = analyze_gdb(matches.opt_str("gdb"));
+
     Config {
         compile_lib_path: make_absolute(opt_path(matches, "compile-lib-path")),
         run_lib_path: make_absolute(opt_path(matches, "run-lib-path")),
@@ -163,20 +163,21 @@ pub fn parse_config(args: Vec<String> ) -> Config {
         mode: matches.opt_str("mode").unwrap().parse().ok().expect("invalid mode"),
         run_ignored: matches.opt_present("ignored"),
         filter: matches.free.first().cloned(),
+        filter_exact: matches.opt_present("exact"),
         logfile: matches.opt_str("logfile").map(|s| PathBuf::from(&s)),
         runtool: matches.opt_str("runtool"),
         host_rustcflags: matches.opt_str("host-rustcflags"),
         target_rustcflags: matches.opt_str("target-rustcflags"),
         target: opt_str2(matches.opt_str("target")),
         host: opt_str2(matches.opt_str("host")),
-        gdb_version: extract_gdb_version(matches.opt_str("gdb-version")),
+        gdb: gdb,
+        gdb_version: gdb_version,
+        gdb_native_rust: gdb_native_rust,
         lldb_version: extract_lldb_version(matches.opt_str("lldb-version")),
         llvm_version: matches.opt_str("llvm-version"),
         android_cross_path: opt_path(matches, "android-cross-path"),
         adb_path: opt_str2(matches.opt_str("adb-path")),
-        adb_test_dir: format!("{}/{}",
-            opt_str2(matches.opt_str("adb-test-dir")),
-            opt_str2(matches.opt_str("target"))),
+        adb_test_dir: opt_str2(matches.opt_str("adb-test-dir")),
         adb_device_status:
             opt_str2(matches.opt_str("target")).contains("android") &&
             "(none)" != opt_str2(matches.opt_str("adb-test-dir")) &&
@@ -184,6 +185,7 @@ pub fn parse_config(args: Vec<String> ) -> Config {
         lldb_python_dir: matches.opt_str("lldb-python-dir"),
         verbose: matches.opt_present("verbose"),
         quiet: matches.opt_present("quiet"),
+        remote_test_client: matches.opt_str("remote-test-client").map(PathBuf::from),
 
         cc: matches.opt_str("cc").unwrap(),
         cxx: matches.opt_str("cxx").unwrap(),
@@ -210,6 +212,7 @@ pub fn log_config(config: &Config) {
                     opt_str(&config.filter
                                    .as_ref()
                                    .map(|re| re.to_owned()))));
+    logv(c, format!("filter_exact: {}", config.filter_exact));
     logv(c, format!("runtool: {}", opt_str(&config.runtool)));
     logv(c, format!("host-rustcflags: {}",
                     opt_str(&config.host_rustcflags)));
@@ -247,12 +250,15 @@ pub fn run_tests(config: &Config) {
         if let DebugInfoGdb = config.mode {
             println!("{} debug-info test uses tcp 5039 port.\
                      please reserve it", config.target);
-        }
 
-        // android debug-info test uses remote debugger
-        // so, we test 1 thread at once.
-        // also trying to isolate problems with adb_run_wrapper.sh ilooping
-        env::set_var("RUST_TEST_THREADS","1");
+            // android debug-info test uses remote debugger so, we test 1 thread
+            // at once as they're all sharing the same TCP port to communicate
+            // over.
+            //
+            // we should figure out how to lift this restriction! (run them all
+            // on different ports allocated dynamically).
+            env::set_var("RUST_TEST_THREADS", "1");
+        }
     }
 
     match config.mode {
@@ -273,6 +279,15 @@ pub fn run_tests(config: &Config) {
             // time.
             env::set_var("RUST_TEST_THREADS", "1");
         }
+
+        DebugInfoGdb => {
+            if config.remote_test_client.is_some() &&
+               !config.target.contains("android"){
+                println!("WARNING: debuginfo tests are not available when \
+                          testing with remote");
+                return
+            }
+        }
         _ => { /* proceed */ }
     }
 
@@ -290,6 +305,10 @@ pub fn run_tests(config: &Config) {
     // Prevent issue #21352 UAC blocking .exe containing 'patch' etc. on Windows
     // If #11207 is resolved (adding manifest to .exe) this becomes unnecessary
     env::set_var("__COMPAT_LAYER", "RunAsInvoker");
+
+    // Let tests know which target they're running as
+    env::set_var("TARGET", &config.target);
+
     let res = test::run_tests_console(&opts, tests.into_iter().collect());
     match res {
         Ok(true) => {}
@@ -303,6 +322,7 @@ pub fn run_tests(config: &Config) {
 pub fn test_opts(config: &Config) -> test::TestOpts {
     test::TestOpts {
         filter: config.filter.clone(),
+        filter_exact: config.filter_exact,
         run_ignored: config.run_ignored,
         quiet: config.quiet,
         logfile: config.logfile.clone(),
@@ -315,6 +335,8 @@ pub fn test_opts(config: &Config) -> test::TestOpts {
         color: test::AutoColor,
         test_threads: None,
         skip: vec![],
+        list: false,
+        options: test::Options::new(),
     }
 }
 
@@ -433,7 +455,7 @@ pub fn make_test(config: &Config, testpaths: &TestPaths) -> test::TestDescAndFn 
     };
 
     // Debugging emscripten code doesn't make sense today
-    let mut ignore = early_props.ignore;
+    let mut ignore = early_props.ignore || !up_to_date(config, testpaths, &early_props);
     if (config.mode == DebugInfoGdb || config.mode == DebugInfoLldb) &&
         config.target.contains("emscripten") {
         ignore = true;
@@ -447,6 +469,40 @@ pub fn make_test(config: &Config, testpaths: &TestPaths) -> test::TestDescAndFn 
         },
         testfn: make_test_closure(config, testpaths),
     }
+}
+
+fn stamp(config: &Config, testpaths: &TestPaths) -> PathBuf {
+    let stamp_name = format!("{}-{}.stamp",
+                             testpaths.file.file_name().unwrap()
+                                           .to_str().unwrap(),
+                             config.stage_id);
+    config.build_base.canonicalize()
+          .unwrap_or(config.build_base.clone())
+          .join(stamp_name)
+}
+
+fn up_to_date(config: &Config, testpaths: &TestPaths, props: &EarlyProps) -> bool {
+    let stamp = mtime(&stamp(config, testpaths));
+    let mut inputs = vec![
+        mtime(&testpaths.file),
+        mtime(&config.rustc_path),
+    ];
+    for aux in props.aux.iter() {
+        inputs.push(mtime(&testpaths.file.parent().unwrap()
+                                         .join("auxiliary")
+                                         .join(aux)));
+    }
+    for lib in config.run_lib_path.read_dir().unwrap() {
+        let lib = lib.unwrap();
+        inputs.push(mtime(&lib.path()));
+    }
+    inputs.iter().any(|input| *input > stamp)
+}
+
+fn mtime(path: &Path) -> FileTime {
+    fs::metadata(path).map(|f| {
+        FileTime::from_last_modification_time(&f)
+    }).unwrap_or(FileTime::zero())
 }
 
 pub fn make_test_name(config: &Config, testpaths: &TestPaths) -> test::TestName {
@@ -468,44 +524,95 @@ pub fn make_test_closure(config: &Config, testpaths: &TestPaths) -> test::TestFn
     }))
 }
 
-fn extract_gdb_version(full_version_line: Option<String>) -> Option<String> {
-    match full_version_line {
-        Some(ref full_version_line)
-          if !full_version_line.trim().is_empty() => {
-            let full_version_line = full_version_line.trim();
+/// Returns (Path to GDB, GDB Version, GDB has Rust Support)
+fn analyze_gdb(gdb: Option<String>) -> (Option<String>, Option<u32>, bool) {
+    #[cfg(not(windows))]
+    const GDB_FALLBACK: &str = "gdb";
+    #[cfg(windows)]
+    const GDB_FALLBACK: &str = "gdb.exe";
 
-            // used to be a regex "(^|[^0-9])([0-9]\.[0-9]+)"
-            for (pos, c) in full_version_line.char_indices() {
-                if !c.is_digit(10) {
-                    continue
-                }
-                if pos + 2 >= full_version_line.len() {
-                    continue
-                }
-                if full_version_line[pos + 1..].chars().next().unwrap() != '.' {
-                    continue
-                }
-                if !full_version_line[pos + 2..].chars().next().unwrap().is_digit(10) {
-                    continue
-                }
-                if pos > 0 && full_version_line[..pos].chars().next_back()
-                                                      .unwrap().is_digit(10) {
-                    continue
-                }
-                let mut end = pos + 3;
-                while end < full_version_line.len() &&
-                      full_version_line[end..].chars().next()
-                                              .unwrap().is_digit(10) {
-                    end += 1;
-                }
-                return Some(full_version_line[pos..end].to_owned());
-            }
-            println!("Could not extract GDB version from line '{}'",
-                     full_version_line);
-            None
-        },
-        _ => None
+    const MIN_GDB_WITH_RUST: u32 = 7011010;
+
+    let gdb = match gdb {
+        None => GDB_FALLBACK,
+        Some(ref s) if s.is_empty() => GDB_FALLBACK, // may be empty if configure found no gdb
+        Some(ref s) => s,
+    };
+
+    let version_line = Command::new(gdb).arg("--version").output().map(|output| {
+        String::from_utf8_lossy(&output.stdout).lines().next().unwrap().to_string()
+    }).ok();
+
+    let version = match version_line {
+        Some(line) => extract_gdb_version(&line),
+        None => return (None, None, false),
+    };
+
+    let gdb_native_rust = version.map_or(false, |v| v >= MIN_GDB_WITH_RUST);
+
+    return (Some(gdb.to_owned()), version, gdb_native_rust);
+}
+
+fn extract_gdb_version(full_version_line: &str) -> Option<u32> {
+    let full_version_line = full_version_line.trim();
+
+    // GDB versions look like this: "major.minor.patch?.yyyymmdd?", with both
+    // of the ? sections being optional
+
+    // We will parse up to 3 digits for minor and patch, ignoring the date
+    // We limit major to 1 digit, otherwise, on openSUSE, we parse the openSUSE version
+
+    // don't start parsing in the middle of a number
+    let mut prev_was_digit = false;
+    for (pos, c) in full_version_line.char_indices() {
+        if prev_was_digit || !c.is_digit(10) {
+            prev_was_digit = c.is_digit(10);
+            continue
+        }
+
+        prev_was_digit = true;
+
+        let line = &full_version_line[pos..];
+
+        let next_split = match line.find(|c: char| !c.is_digit(10)) {
+            Some(idx) => idx,
+            None => continue, // no minor version
+        };
+
+        if line.as_bytes()[next_split] != b'.' {
+            continue; // no minor version
+        }
+
+        let major = &line[..next_split];
+        let line = &line[next_split + 1..];
+
+        let (minor, patch) = match line.find(|c: char| !c.is_digit(10)) {
+            Some(idx) => if line.as_bytes()[idx] == b'.' {
+                let patch = &line[idx + 1..];
+
+                let patch_len = patch.find(|c: char| !c.is_digit(10)).unwrap_or(patch.len());
+                let patch = &patch[..patch_len];
+                let patch = if patch_len > 3 || patch_len == 0 { None } else { Some(patch) };
+
+                (&line[..idx], patch)
+            } else {
+                (&line[..idx], None)
+            },
+            None => (line, None),
+        };
+
+        if major.len() != 1 || minor.is_empty() {
+            continue;
+        }
+
+        let major: u32 = major.parse().unwrap();
+        let minor: u32 = minor.parse().unwrap();
+        let patch: u32 = patch.unwrap_or("0").parse().unwrap();
+
+        return Some(((major * 1000) + minor) * 1000 + patch);
     }
+
+    None
 }
 
 fn extract_lldb_version(full_version_line: Option<String>) -> Option<String> {
@@ -541,8 +648,6 @@ fn extract_lldb_version(full_version_line: Option<String>) -> Option<String> {
                 }).collect::<String>();
                 if !vers.is_empty() { return Some(vers) }
             }
-            println!("Could not extract LLDB version from line '{}'",
-                     full_version_line);
         }
     }
     None
@@ -550,4 +655,45 @@ fn extract_lldb_version(full_version_line: Option<String>) -> Option<String> {
 
 fn is_blacklisted_lldb_version(version: &str) -> bool {
     version == "350"
+}
+
+#[test]
+fn test_extract_gdb_version() {
+    macro_rules! test { ($($expectation:tt: $input:tt,)*) => {{$(
+        assert_eq!(extract_gdb_version($input), Some($expectation));
+    )*}}}
+
+    test! {
+        7000001: "GNU gdb (GDB) CentOS (7.0.1-45.el5.centos)",
+
+        7002000: "GNU gdb (GDB) Red Hat Enterprise Linux (7.2-90.el6)",
+
+        7004000: "GNU gdb (Ubuntu/Linaro 7.4-2012.04-0ubuntu2.1) 7.4-2012.04",
+        7004001: "GNU gdb (GDB) 7.4.1-debian",
+
+        7006001: "GNU gdb (GDB) Red Hat Enterprise Linux 7.6.1-80.el7",
+
+        7007001: "GNU gdb (Ubuntu 7.7.1-0ubuntu5~14.04.2) 7.7.1",
+        7007001: "GNU gdb (Debian 7.7.1+dfsg-5) 7.7.1",
+        7007001: "GNU gdb (GDB) Fedora 7.7.1-21.fc20",
+
+        7008000: "GNU gdb (GDB; openSUSE 13.2) 7.8",
+        7009001: "GNU gdb (GDB) Fedora 7.9.1-20.fc22",
+        7010001: "GNU gdb (GDB) Fedora 7.10.1-31.fc23",
+
+        7011000: "GNU gdb (Ubuntu 7.11-0ubuntu1) 7.11",
+        7011001: "GNU gdb (Ubuntu 7.11.1-0ubuntu1~16.04) 7.11.1",
+        7011001: "GNU gdb (Debian 7.11.1-2) 7.11.1",
+        7011001: "GNU gdb (GDB) Fedora 7.11.1-86.fc24",
+        7011001: "GNU gdb (GDB; openSUSE Leap 42.1) 7.11.1",
+        7011001: "GNU gdb (GDB; openSUSE Tumbleweed) 7.11.1",
+
+        7011090: "7.11.90",
+        7011090: "GNU gdb (Ubuntu 7.11.90.20161005-0ubuntu1) 7.11.90.20161005-git",
+
+        7012000: "7.12",
+        7012000: "GNU gdb (GDB) 7.12",
+        7012000: "GNU gdb (GDB) 7.12.20161027-git",
+        7012050: "GNU gdb (GDB) 7.12.50.20161027-git",
+    }
 }

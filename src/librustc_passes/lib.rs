@@ -15,20 +15,19 @@
 //! This API is completely unstable and subject to change.
 
 #![crate_name = "rustc_passes"]
-#![unstable(feature = "rustc_private", issue = "27812")]
 #![crate_type = "dylib"]
 #![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![cfg_attr(not(stage0), deny(warnings))]
+#![deny(warnings)]
 
-#![feature(dotdot_in_tuple_patterns)]
 #![feature(rustc_diagnostic_macros)]
-#![feature(staged_api)]
-#![feature(rustc_private)]
 
-extern crate core;
+#![cfg_attr(stage0, unstable(feature = "rustc_private", issue = "27812"))]
+#![cfg_attr(stage0, feature(rustc_private))]
+#![cfg_attr(stage0, feature(staged_api))]
+
 #[macro_use]
 extern crate rustc;
 extern crate rustc_const_eval;
@@ -45,7 +44,8 @@ pub mod diagnostics;
 
 pub mod ast_validation;
 pub mod consts;
+pub mod hir_stats;
 pub mod loops;
+pub mod mir_stats;
 pub mod no_asm;
-pub mod rvalues;
 pub mod static_recursion;

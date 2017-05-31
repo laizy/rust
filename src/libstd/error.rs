@@ -65,9 +65,13 @@ use string;
 pub trait Error: Debug + Display {
     /// A short description of the error.
     ///
-    /// The description should not contain newlines or sentence-ending
-    /// punctuation, to facilitate embedding in larger user-facing
-    /// strings.
+    /// The description should only be used for a simple message.
+    /// It should not contain newlines or sentence-ending punctuation,
+    /// to facilitate embedding in larger user-facing strings.
+    /// For showing formatted error messages with more information see
+    /// [`Display`].
+    ///
+    /// [`Display`]: ../fmt/trait.Display.html
     ///
     /// # Examples
     ///
@@ -105,7 +109,7 @@ pub trait Error: Debug + Display {
     ///
     /// impl Error for SuperError {
     ///     fn description(&self) -> &str {
-    ///         "I'm the superhero of errors!"
+    ///         "I'm the superhero of errors"
     ///     }
     ///
     ///     fn cause(&self) -> Option<&Error> {
@@ -124,7 +128,7 @@ pub trait Error: Debug + Display {
     ///
     /// impl Error for SuperErrorSideKick {
     ///     fn description(&self) -> &str {
-    ///         "I'm SuperError side kick!"
+    ///         "I'm SuperError side kick"
     ///     }
     /// }
     ///
@@ -189,7 +193,7 @@ impl From<String> for Box<Error + Send + Sync> {
     }
 }
 
-#[stable(feature = "string_box_error", since = "1.7.0")]
+#[stable(feature = "string_box_error", since = "1.6.0")]
 impl From<String> for Box<Error> {
     fn from(str_err: String) -> Box<Error> {
         let err1: Box<Error + Send + Sync> = From::from(str_err);
@@ -205,11 +209,16 @@ impl<'a, 'b> From<&'b str> for Box<Error + Send + Sync + 'a> {
     }
 }
 
-#[stable(feature = "string_box_error", since = "1.7.0")]
+#[stable(feature = "string_box_error", since = "1.6.0")]
 impl<'a> From<&'a str> for Box<Error> {
     fn from(err: &'a str) -> Box<Error> {
         From::from(String::from(err))
     }
+}
+
+#[unstable(feature = "never_type_impls", issue = "35121")]
+impl Error for ! {
+    fn description(&self) -> &str { *self }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -273,7 +282,7 @@ impl Error for char::DecodeUtf16Error {
     }
 }
 
-#[stable(feature = "box_error", since = "1.7.0")]
+#[stable(feature = "box_error", since = "1.8.0")]
 impl<T: Error> Error for Box<T> {
     fn description(&self) -> &str {
         Error::description(&**self)

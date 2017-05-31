@@ -14,15 +14,27 @@
 #![feature(rustc_private)]
 #![plugin(proc_macro_plugin)]
 
-extern crate proc_macro_plugin;
-use proc_macro_plugin::prelude::*;
-
 extern crate syntax;
-use syntax::ast::Ident;
-use syntax::codemap::DUMMY_SP;
-use syntax::parse::token::{self, Token, keywords, str_to_ident};
+extern crate syntax_pos;
+
+use syntax::ast::{Ident, Name};
+use syntax::parse::token::{self, Token, Lit};
+use syntax::tokenstream::TokenTree;
 
 fn main() {
-    let lex_true = lex("true");
-    assert_eq!(qquote!(true).eq_unspanned(&lex_true), true);
+    let true_tok = token::Ident(Ident::from_str("true"));
+    assert!(quote!(true).eq_unspanned(&true_tok.into()));
+
+    // issue #35829, extended check to proc_macro.
+    let triple_dot_tok = Token::DotDotDot;
+    assert!(quote!(...).eq_unspanned(&triple_dot_tok.into()));
+
+    let byte_str_tok = Token::Literal(Lit::ByteStr(Name::intern("one")), None);
+    assert!(quote!(b"one").eq_unspanned(&byte_str_tok.into()));
+
+    let byte_str_raw_tok = Token::Literal(Lit::ByteStrRaw(Name::intern("#\"two\"#"), 3), None);
+    assert!(quote!(br###"#"two"#"###).eq_unspanned(&byte_str_raw_tok.into()));
+
+    let str_raw_tok = Token::Literal(Lit::StrRaw(Name::intern("#\"three\"#"), 2), None);
+    assert!(quote!(r##"#"three"#"##).eq_unspanned(&str_raw_tok.into()));
 }

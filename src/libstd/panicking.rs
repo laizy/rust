@@ -153,13 +153,31 @@ pub fn take_hook() -> Box<Fn(&PanicInfo) + 'static + Sync + Send> {
 
         match hook {
             Hook::Default => Box::new(default_hook),
-            Hook::Custom(ptr) => {Box::from_raw(ptr)} // FIXME #30530
+            Hook::Custom(ptr) => Box::from_raw(ptr),
         }
     }
 }
 
 /// A struct providing information about a panic.
+///
+/// `PanicInfo` structure is passed to a panic hook set by the [`set_hook`]
+/// function.
+///
+/// [`set_hook`]: ../../std/panic/fn.set_hook.html
+///
+/// # Examples
+///
+/// ```should_panic
+/// use std::panic;
+///
+/// panic::set_hook(Box::new(|panic_info| {
+///     println!("panic occured: {:?}", panic_info.payload().downcast_ref::<&str>().unwrap());
+/// }));
+///
+/// panic!("Normal panic");
+/// ```
 #[stable(feature = "panic_hooks", since = "1.10.0")]
+#[derive(Debug)]
 pub struct PanicInfo<'a> {
     payload: &'a (Any + Send),
     location: Location<'a>,
@@ -168,7 +186,21 @@ pub struct PanicInfo<'a> {
 impl<'a> PanicInfo<'a> {
     /// Returns the payload associated with the panic.
     ///
-    /// This will commonly, but not always, be a `&'static str` or `String`.
+    /// This will commonly, but not always, be a `&'static str` or [`String`].
+    ///
+    /// [`String`]: ../../std/string/struct.String.html
+    ///
+    /// # Examples
+    ///
+    /// ```should_panic
+    /// use std::panic;
+    ///
+    /// panic::set_hook(Box::new(|panic_info| {
+    ///     println!("panic occured: {:?}", panic_info.payload().downcast_ref::<&str>().unwrap());
+    /// }));
+    ///
+    /// panic!("Normal panic");
+    /// ```
     #[stable(feature = "panic_hooks", since = "1.10.0")]
     pub fn payload(&self) -> &(Any + Send) {
         self.payload
@@ -177,8 +209,26 @@ impl<'a> PanicInfo<'a> {
     /// Returns information about the location from which the panic originated,
     /// if available.
     ///
-    /// This method will currently always return `Some`, but this may change
+    /// This method will currently always return [`Some`], but this may change
     /// in future versions.
+    ///
+    /// [`Some`]: ../../std/option/enum.Option.html#variant.Some
+    ///
+    /// # Examples
+    ///
+    /// ```should_panic
+    /// use std::panic;
+    ///
+    /// panic::set_hook(Box::new(|panic_info| {
+    ///     if let Some(location) = panic_info.location() {
+    ///         println!("panic occured in file '{}' at line {}", location.file(), location.line());
+    ///     } else {
+    ///         println!("panic occured but can't get location information...");
+    ///     }
+    /// }));
+    ///
+    /// panic!("Normal panic");
+    /// ```
     #[stable(feature = "panic_hooks", since = "1.10.0")]
     pub fn location(&self) -> Option<&Location> {
         Some(&self.location)
@@ -186,6 +236,28 @@ impl<'a> PanicInfo<'a> {
 }
 
 /// A struct containing information about the location of a panic.
+///
+/// This structure is created by the [`location`] method of [`PanicInfo`].
+///
+/// [`location`]: ../../std/panic/struct.PanicInfo.html#method.location
+/// [`PanicInfo`]: ../../std/panic/struct.PanicInfo.html
+///
+/// # Examples
+///
+/// ```should_panic
+/// use std::panic;
+///
+/// panic::set_hook(Box::new(|panic_info| {
+///     if let Some(location) = panic_info.location() {
+///         println!("panic occured in file '{}' at line {}", location.file(), location.line());
+///     } else {
+///         println!("panic occured but can't get location information...");
+///     }
+/// }));
+///
+/// panic!("Normal panic");
+/// ```
+#[derive(Debug)]
 #[stable(feature = "panic_hooks", since = "1.10.0")]
 pub struct Location<'a> {
     file: &'a str,
@@ -194,12 +266,44 @@ pub struct Location<'a> {
 
 impl<'a> Location<'a> {
     /// Returns the name of the source file from which the panic originated.
+    ///
+    /// # Examples
+    ///
+    /// ```should_panic
+    /// use std::panic;
+    ///
+    /// panic::set_hook(Box::new(|panic_info| {
+    ///     if let Some(location) = panic_info.location() {
+    ///         println!("panic occured in file '{}'", location.file());
+    ///     } else {
+    ///         println!("panic occured but can't get location information...");
+    ///     }
+    /// }));
+    ///
+    /// panic!("Normal panic");
+    /// ```
     #[stable(feature = "panic_hooks", since = "1.10.0")]
     pub fn file(&self) -> &str {
         self.file
     }
 
     /// Returns the line number from which the panic originated.
+    ///
+    /// # Examples
+    ///
+    /// ```should_panic
+    /// use std::panic;
+    ///
+    /// panic::set_hook(Box::new(|panic_info| {
+    ///     if let Some(location) = panic_info.location() {
+    ///         println!("panic occured at line {}", location.line());
+    ///     } else {
+    ///         println!("panic occured but can't get location information...");
+    ///     }
+    /// }));
+    ///
+    /// panic!("Normal panic");
+    /// ```
     #[stable(feature = "panic_hooks", since = "1.10.0")]
     pub fn line(&self) -> u32 {
         self.line
@@ -207,16 +311,20 @@ impl<'a> Location<'a> {
 }
 
 fn default_hook(info: &PanicInfo) {
-    #[cfg(any(not(cargobuild), feature = "backtrace"))]
+    #[cfg(feature = "backtrace")]
     use sys_common::backtrace;
 
     // If this is a double panic, make sure that we print a backtrace
     // for this panic. Otherwise only print it if logging is enabled.
-    #[cfg(any(not(cargobuild), feature = "backtrace"))]
+    #[cfg(feature = "backtrace")]
     let log_backtrace = {
         let panics = update_panic_count(0);
 
-        panics >= 2 || backtrace::log_enabled()
+        if panics >= 2 {
+            Some(backtrace::PrintFormat::Full)
+        } else {
+            backtrace::log_enabled()
+        }
     };
 
     let file = info.location.file;
@@ -237,14 +345,14 @@ fn default_hook(info: &PanicInfo) {
         let _ = writeln!(err, "thread '{}' panicked at '{}', {}:{}",
                          name, msg, file, line);
 
-        #[cfg(any(not(cargobuild), feature = "backtrace"))]
+        #[cfg(feature = "backtrace")]
         {
             use sync::atomic::{AtomicBool, Ordering};
 
             static FIRST_PANIC: AtomicBool = AtomicBool::new(true);
 
-            if log_backtrace {
-                let _ = backtrace::write(err);
+            if let Some(format) = log_backtrace {
+                let _ = backtrace::print(err, format);
             } else if FIRST_PANIC.compare_and_swap(true, false, Ordering::SeqCst) {
                 let _ = writeln!(err, "note: Run with `RUST_BACKTRACE=1` for a backtrace.");
             }
@@ -285,28 +393,23 @@ pub use realstd::rt::update_panic_count;
 
 /// Invoke a closure, capturing the cause of an unwinding panic if one occurs.
 pub unsafe fn try<R, F: FnOnce() -> R>(f: F) -> Result<R, Box<Any + Send>> {
-    struct Data<F, R> {
+    #[allow(unions_with_drop_fields)]
+    union Data<F, R> {
         f: F,
         r: R,
     }
 
     // We do some sketchy operations with ownership here for the sake of
-    // performance. The `Data` structure is never actually fully valid, but
-    // instead it always contains at least one uninitialized field. We can only
-    // pass pointers down to `__rust_maybe_catch_panic` (can't pass objects by
-    // value), so we do all the ownership tracking here manully.
+    // performance. We can only  pass pointers down to
+    // `__rust_maybe_catch_panic` (can't pass objects by value), so we do all
+    // the ownership tracking here manually using a union.
     //
-    // Note that this is all invalid if any of these functions unwind, but the
-    // whole point of this function is to prevent that! As a result we go
-    // through a transition where:
+    // We go through a transition where:
     //
-    // * First, only the closure we're going to call is initialized. The return
-    //   value is uninitialized.
+    // * First, we set the data to be the closure that we're going to call.
     // * When we make the function call, the `do_call` function below, we take
-    //   ownership of the function pointer, replacing it with uninitialized
-    //   data. At this point the `Data` structure is entirely uninitialized, but
-    //   it won't drop due to an unwind because it's owned on the other side of
-    //   the catch panic.
+    //   ownership of the function pointer. At this point the `Data` union is
+    //   entirely uninitialized.
     // * If the closure successfully returns, we write the return value into the
     //   data's return slot. Note that `ptr::write` is used as it's overwriting
     //   uninitialized data.
@@ -314,11 +417,10 @@ pub unsafe fn try<R, F: FnOnce() -> R>(f: F) -> Result<R, Box<Any + Send>> {
     //   in one of two states:
     //
     //      1. The closure didn't panic, in which case the return value was
-    //         filled in. We have to be careful to `forget` the closure,
-    //         however, as ownership was passed to the `do_call` function.
+    //         filled in. We move it out of `data` and return it.
     //      2. The closure panicked, in which case the return value wasn't
-    //         filled in. In this case the entire `data` structure is invalid,
-    //         so we forget the entire thing.
+    //         filled in. In this case the entire `data` union is invalid, so
+    //         there is no need to drop anything.
     //
     // Once we stack all that together we should have the "most efficient'
     // method of calling a catch panic whilst juggling ownership.
@@ -326,7 +428,6 @@ pub unsafe fn try<R, F: FnOnce() -> R>(f: F) -> Result<R, Box<Any + Send>> {
     let mut any_vtable = 0;
     let mut data = Data {
         f: f,
-        r: mem::uninitialized(),
     };
 
     let r = __rust_maybe_catch_panic(do_call::<F, R>,
@@ -335,12 +436,9 @@ pub unsafe fn try<R, F: FnOnce() -> R>(f: F) -> Result<R, Box<Any + Send>> {
                                      &mut any_vtable);
 
     return if r == 0 {
-        let Data { f, r } = data;
-        mem::forget(f);
         debug_assert!(update_panic_count(0) == 0);
-        Ok(r)
+        Ok(data.r)
     } else {
-        mem::forget(data);
         update_panic_count(-1);
         debug_assert!(update_panic_count(0) == 0);
         Err(mem::transmute(raw::TraitObject {

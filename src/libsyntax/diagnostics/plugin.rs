@@ -19,6 +19,7 @@ use ext::base::{ExtCtxt, MacEager, MacResult};
 use ext::build::AstBuilder;
 use parse::token;
 use ptr::P;
+use symbol::Symbol;
 use tokenstream::{TokenTree};
 use util::small_vector::SmallVector;
 
@@ -119,7 +120,7 @@ pub fn expand_register_diagnostic<'cx>(ecx: &'cx mut ExtCtxt,
 
         // URLs can be unavoidably longer than the line limit, so we allow them.
         // Allowed format is: `[name]: https://www.rust-lang.org/`
-        let is_url = |l: &str| l.starts_with('[') && l.contains("]:") && l.contains("http");
+        let is_url = |l: &str| l.starts_with("[") && l.contains("]:") && l.contains("http");
 
         if msg.lines().any(|line| line.len() > MAX_DESCRIPTION_WIDTH && !is_url(line)) {
             ecx.span_err(span, &format!(
@@ -141,7 +142,7 @@ pub fn expand_register_diagnostic<'cx>(ecx: &'cx mut ExtCtxt,
             ));
         }
     });
-    let sym = Ident::with_empty_ctxt(token::gensym(&format!(
+    let sym = Ident::with_empty_ctxt(Symbol::gensym(&format!(
         "__register_diagnostic_{}", code
     )));
     MacEager::items(SmallVector::many(vec![
@@ -176,7 +177,7 @@ pub fn expand_build_diagnostic_array<'cx>(ecx: &'cx mut ExtCtxt,
             if let Err(e) = output_metadata(ecx,
                                             &target_triple,
                                             &crate_name.name.as_str(),
-                                            &diagnostics) {
+                                            diagnostics) {
                 ecx.span_bug(span, &format!(
                     "error writing metadata for triple `{}` and crate `{}`, error: {}, \
                      cause: {:?}",
@@ -194,18 +195,18 @@ pub fn expand_build_diagnostic_array<'cx>(ecx: &'cx mut ExtCtxt,
     let (count, expr) =
         with_registered_diagnostics(|diagnostics| {
             let descriptions: Vec<P<ast::Expr>> =
-                diagnostics.iter().filter_map(|(code, info)| {
+                diagnostics.iter().filter_map(|(&code, info)| {
                     info.description.map(|description| {
                         ecx.expr_tuple(span, vec![
-                            ecx.expr_str(span, code.as_str()),
-                            ecx.expr_str(span, description.as_str())
+                            ecx.expr_str(span, code),
+                            ecx.expr_str(span, description)
                         ])
                     })
                 }).collect();
             (descriptions.len(), ecx.expr_vec(span, descriptions))
         });
 
-    let static_ = ecx.lifetime(span, ecx.name_of("'static"));
+    let static_ = ecx.lifetime(span, Ident::from_str("'static"));
     let ty_str = ecx.ty_rptr(
         span,
         ecx.ty_ident(span, ecx.ident_of("str")),
@@ -226,7 +227,7 @@ pub fn expand_build_diagnostic_array<'cx>(ecx: &'cx mut ExtCtxt,
 
     MacEager::items(SmallVector::many(vec![
         P(ast::Item {
-            ident: name.clone(),
+            ident: *name,
             attrs: Vec::new(),
             id: ast::DUMMY_NODE_ID,
             node: ast::ItemKind::Const(

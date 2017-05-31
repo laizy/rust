@@ -13,6 +13,7 @@ use super::InferCtxt;
 use super::lattice::{self, LatticeDir};
 use super::Subtype;
 
+use traits::ObligationCause;
 use ty::{self, Ty, TyCtxt};
 use ty::relate::{Relate, RelateResult, TypeRelation};
 
@@ -48,7 +49,8 @@ impl<'combine, 'infcx, 'gcx, 'tcx> TypeRelation<'infcx, 'gcx, 'tcx>
         match variance {
             ty::Invariant => self.fields.equate(self.a_is_expected).relate(a, b),
             ty::Covariant => self.relate(a, b),
-            ty::Bivariant => self.fields.bivariate(self.a_is_expected).relate(a, b),
+            // FIXME(#41044) -- not correct, need test
+            ty::Bivariant => Ok(a.clone()),
             ty::Contravariant => self.fields.lub(self.a_is_expected).relate(a, b),
         }
     }
@@ -57,8 +59,8 @@ impl<'combine, 'infcx, 'gcx, 'tcx> TypeRelation<'infcx, 'gcx, 'tcx>
         lattice::super_lattice_tys(self, a, b)
     }
 
-    fn regions(&mut self, a: &'tcx ty::Region, b: &'tcx ty::Region)
-               -> RelateResult<'tcx, &'tcx ty::Region> {
+    fn regions(&mut self, a: ty::Region<'tcx>, b: ty::Region<'tcx>)
+               -> RelateResult<'tcx, ty::Region<'tcx>> {
         debug!("{}.regions({:?}, {:?})",
                self.tag(),
                a,
@@ -81,6 +83,10 @@ impl<'combine, 'infcx, 'gcx, 'tcx> LatticeDir<'infcx, 'gcx, 'tcx>
 {
     fn infcx(&self) -> &'infcx InferCtxt<'infcx, 'gcx, 'tcx> {
         self.fields.infcx
+    }
+
+    fn cause(&self) -> &ObligationCause<'tcx> {
+        &self.fields.trace.cause
     }
 
     fn relate_bound(&mut self, v: Ty<'tcx>, a: Ty<'tcx>, b: Ty<'tcx>) -> RelateResult<'tcx, ()> {

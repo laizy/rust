@@ -19,10 +19,6 @@ use std::iter::repeat;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use hir;
-use hir::intravisit;
-use hir::intravisit::Visitor;
-
 // The name of the associated type for `Fn` return types
 pub const FN_OUTPUT_NAME: &'static str = "Output";
 
@@ -31,13 +27,27 @@ pub const FN_OUTPUT_NAME: &'static str = "Output";
 #[derive(Clone, Copy, Debug)]
 pub struct ErrorReported;
 
+thread_local!(static TIME_DEPTH: Cell<usize> = Cell::new(0));
+
+/// Read the current depth of `time()` calls. This is used to
+/// encourage indentation across threads.
+pub fn time_depth() -> usize {
+    TIME_DEPTH.with(|slot| slot.get())
+}
+
+/// Set the current depth of `time()` calls. The idea is to call
+/// `set_time_depth()` with the result from `time_depth()` in the
+/// parent thread.
+pub fn set_time_depth(depth: usize) {
+    TIME_DEPTH.with(|slot| slot.set(depth));
+}
+
 pub fn time<T, F>(do_it: bool, what: &str, f: F) -> T where
     F: FnOnce() -> T,
 {
-    thread_local!(static DEPTH: Cell<usize> = Cell::new(0));
     if !do_it { return f(); }
 
-    let old = DEPTH.with(|slot| {
+    let old = TIME_DEPTH.with(|slot| {
         let r = slot.get();
         slot.set(r + 1);
         r
@@ -60,7 +70,7 @@ pub fn time<T, F>(do_it: bool, what: &str, f: F) -> T where
              mem_string,
              what);
 
-    DEPTH.with(|slot| slot.set(old));
+    TIME_DEPTH.with(|slot| slot.set(old));
 
     rv
 }
@@ -75,6 +85,26 @@ pub fn duration_to_secs_str(dur: Duration) -> String {
     format!("{:.3}", secs)
 }
 
+pub fn to_readable_str(mut val: usize) -> String {
+    let mut groups = vec![];
+    loop {
+        let group = val % 1000;
+
+        val /= 1000;
+
+        if val == 0 {
+            groups.push(format!("{}", group));
+            break;
+        } else {
+            groups.push(format!("{:03}", group));
+        }
+    }
+
+    groups.reverse();
+
+    groups.join("_")
+}
+
 pub fn record_time<T, F>(accu: &Cell<Duration>, f: F) -> T where
     F: FnOnce() -> T,
 {
@@ -86,6 +116,7 @@ pub fn record_time<T, F>(accu: &Cell<Duration>, f: F) -> T where
 }
 
 // Like std::macros::try!, but for Option<>.
+#[cfg(unix)]
 macro_rules! option_try(
     ($e:expr) => (match $e { Some(e) => e, None => return None })
 );
@@ -112,7 +143,8 @@ fn get_resident() -> Option<usize> {
     type HANDLE = *mut u8;
     use libc::size_t;
     use std::mem;
-    #[repr(C)] #[allow(non_snake_case)]
+    #[repr(C)]
+    #[allow(non_snake_case)]
     struct PROCESS_MEMORY_COUNTERS {
         cb: DWORD,
         PageFaultCount: DWORD,
@@ -154,7 +186,7 @@ pub fn indent<R, F>(op: F) -> R where
 }
 
 pub struct Indenter {
-    _cannot_construct_outside_of_this_module: ()
+    _cannot_construct_outside_of_this_module: (),
 }
 
 impl Drop for Indenter {
@@ -164,57 +196,6 @@ impl Drop for Indenter {
 pub fn indenter() -> Indenter {
     debug!(">>");
     Indenter { _cannot_construct_outside_of_this_module: () }
-}
-
-struct LoopQueryVisitor<P> where P: FnMut(&hir::Expr_) -> bool {
-    p: P,
-    flag: bool,
-}
-
-impl<'v, P> Visitor<'v> for LoopQueryVisitor<P> where P: FnMut(&hir::Expr_) -> bool {
-    fn visit_expr(&mut self, e: &hir::Expr) {
-        self.flag |= (self.p)(&e.node);
-        match e.node {
-          // Skip inner loops, since a break in the inner loop isn't a
-          // break inside the outer loop
-          hir::ExprLoop(..) | hir::ExprWhile(..) => {}
-          _ => intravisit::walk_expr(self, e)
-        }
-    }
-}
-
-// Takes a predicate p, returns true iff p is true for any subexpressions
-// of b -- skipping any inner loops (loop, while, loop_body)
-pub fn loop_query<P>(b: &hir::Block, p: P) -> bool where P: FnMut(&hir::Expr_) -> bool {
-    let mut v = LoopQueryVisitor {
-        p: p,
-        flag: false,
-    };
-    intravisit::walk_block(&mut v, b);
-    return v.flag;
-}
-
-struct BlockQueryVisitor<P> where P: FnMut(&hir::Expr) -> bool {
-    p: P,
-    flag: bool,
-}
-
-impl<'v, P> Visitor<'v> for BlockQueryVisitor<P> where P: FnMut(&hir::Expr) -> bool {
-    fn visit_expr(&mut self, e: &hir::Expr) {
-        self.flag |= (self.p)(e);
-        intravisit::walk_expr(self, e)
-    }
-}
-
-// Takes a predicate p, returns true iff p is true for any subexpressions
-// of b -- skipping any inner loops (loop, while, loop_body)
-pub fn block_query<P>(b: &hir::Block, p: P) -> bool where P: FnMut(&hir::Expr) -> bool {
-    let mut v = BlockQueryVisitor {
-        p: p,
-        flag: false,
-    };
-    intravisit::walk_block(&mut v, &b);
-    return v.flag;
 }
 
 pub trait MemoizationMap {
@@ -263,4 +244,18 @@ pub fn path2cstr(p: &Path) -> CString {
 #[cfg(windows)]
 pub fn path2cstr(p: &Path) -> CString {
     CString::new(p.to_str().unwrap()).unwrap()
+}
+
+
+#[test]
+fn test_to_readable_str() {
+    assert_eq!("0", to_readable_str(0));
+    assert_eq!("1", to_readable_str(1));
+    assert_eq!("99", to_readable_str(99));
+    assert_eq!("999", to_readable_str(999));
+    assert_eq!("1_000", to_readable_str(1_000));
+    assert_eq!("1_001", to_readable_str(1_001));
+    assert_eq!("999_999", to_readable_str(999_999));
+    assert_eq!("1_000_000", to_readable_str(1_000_000));
+    assert_eq!("1_234_567", to_readable_str(1_234_567));
 }

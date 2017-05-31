@@ -21,7 +21,7 @@ use sys_common::{FromInner, AsInner, AsInnerMut};
 use sys::platform::fs::MetadataExt as UnixMetadataExt;
 
 /// Unix-specific extensions to `File`
-#[unstable(feature = "file_offset", issue = "35918")]
+#[stable(feature = "file_offset", since = "1.15.0")]
 pub trait FileExt {
     /// Reads a number of bytes starting from a given offset.
     ///
@@ -34,7 +34,7 @@ pub trait FileExt {
     ///
     /// Note that similar to `File::read`, it is not an error to return with a
     /// short read.
-    #[unstable(feature = "file_offset", issue = "35918")]
+    #[stable(feature = "file_offset", since = "1.15.0")]
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
 
     /// Writes a number of bytes starting from a given offset.
@@ -51,11 +51,11 @@ pub trait FileExt {
     ///
     /// Note that similar to `File::write`, it is not an error to return a
     /// short write.
-    #[unstable(feature = "file_offset", issue = "35918")]
+    #[stable(feature = "file_offset", since = "1.15.0")]
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize>;
 }
 
-#[unstable(feature = "file_offset", issue = "35918")]
+#[stable(feature = "file_offset", since = "1.15.0")]
 impl FileExt for fs::File {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         self.as_inner().read_at(buf, offset)
@@ -77,8 +77,8 @@ pub trait PermissionsExt {
     /// use std::fs::File;
     /// use std::os::unix::fs::PermissionsExt;
     ///
-    /// let f = try!(File::create("foo.txt"));
-    /// let metadata = try!(f.metadata());
+    /// let f = File::create("foo.txt")?;
+    /// let metadata = f.metadata()?;
     /// let permissions = metadata.permissions();
     ///
     /// println!("permissions: {}", permissions.mode());
@@ -94,8 +94,8 @@ pub trait PermissionsExt {
     /// use std::fs::File;
     /// use std::os::unix::fs::PermissionsExt;
     ///
-    /// let f = try!(File::create("foo.txt"));
-    /// let metadata = try!(f.metadata());
+    /// let f = File::create("foo.txt")?;
+    /// let metadata = f.metadata()?;
     /// let mut permissions = metadata.permissions();
     ///
     /// permissions.set_mode(0o644); // Read/write for owner and read for others.
@@ -335,7 +335,7 @@ impl DirEntryExt for fs::DirEntry {
 /// use std::os::unix::fs;
 ///
 /// # fn foo() -> std::io::Result<()> {
-/// try!(fs::symlink("a.txt", "b.txt"));
+/// fs::symlink("a.txt", "b.txt")?;
 /// # Ok(())
 /// # }
 /// ```

@@ -16,7 +16,7 @@ Read ["Installing Rust"] from [The Book].
 
 1. Make sure you have installed the dependencies:
 
-   * `g++` 4.7 or later or `clang++` 3.x
+   * `g++` 4.7 or later or `clang++` 3.x or later
    * `python` 2.7 (but not 3.x)
    * GNU `make` 3.81 or later
    * `cmake` 3.4.3 or later
@@ -35,17 +35,15 @@ Read ["Installing Rust"] from [The Book].
 3. Build and install:
 
     ```sh
-    $ ./configure
-    $ make && make install
+    $ ./x.py build && sudo ./x.py install
     ```
 
-    > ***Note:*** You may need to use `sudo make install` if you do not
-    > normally have permission to modify the destination directory. The
-    > install locations can be adjusted by passing a `--prefix` argument
-    > to `configure`. Various other options are also supported – pass
-    > `--help` for more information on them.
+    > ***Note:*** Install locations can be adjusted by copying the config file
+    > from `./src/bootstrap/config.toml.example` to `./config.toml`, and
+    > adjusting the `prefix` option under `[install]`. Various other options are
+    > also supported, and are documented in the config file.
 
-    When complete, `make install` will place several programs into
+    When complete, `sudo ./x.py install` will place several programs into
     `/usr/local/bin`: `rustc`, the Rust compiler, and `rustdoc`, the
     API-documentation tool. This install does not include [Cargo],
     Rust's package manager, which you may also want to build.
@@ -60,7 +58,6 @@ you need depends largely on what C/C++ libraries you want to interoperate with:
 for interop with software produced by Visual Studio use the MSVC build of Rust;
 for interop with GNU software built using the MinGW/MSYS2 toolchain use the GNU
 build.
-
 
 #### MinGW
 
@@ -84,8 +81,9 @@ build.
    # Install build tools needed for Rust. If you're building a 32-bit compiler,
    # then replace "x86_64" below with "i686". If you've already got git, python,
    # or CMake installed and in PATH you can remove them from this list. Note
-   # that it is important that the `python2` and `cmake` packages **not** used.
-   # The build has historically been known to fail with these packages.
+   # that it is important that you do **not** use the 'python2' and 'cmake'
+   # packages from the 'msys2' subsystem. The build has historically been known
+   # to fail with these packages.
    $ pacman -S git \
                make \
                diffutils \
@@ -95,11 +93,10 @@ build.
                mingw-w64-x86_64-gcc
    ```
 
-4. Navigate to Rust's source code (or clone it), then configure and build it:
+4. Navigate to Rust's source code (or clone it), then build it:
 
    ```sh
-   $ ./configure
-   $ make && make install
+   $ ./x.py build && ./x.py install
    ```
 
 #### MSVC
@@ -108,59 +105,65 @@ MSVC builds of Rust additionally require an installation of Visual Studio 2013
 (or later) so `rustc` can use its linker. Make sure to check the “C++ tools”
 option.
 
-With these dependencies installed, the build takes two steps:
+With these dependencies installed, you can build the compiler in a `cmd.exe`
+shell with:
 
 ```sh
-$ ./configure
-$ make && make install
+> python x.py build
 ```
 
-#### MSVC with rustbuild
-
-The old build system, based on makefiles, is currently being rewritten into a
-Rust-based build system called rustbuild. This can be used to bootstrap the
-compiler on MSVC without needing to install MSYS or MinGW. All you need are
-[Python 2](https://www.python.org/downloads/),
-[CMake](https://cmake.org/download/), and
-[Git](https://git-scm.com/downloads) in your PATH (make sure you do not use the
-ones from MSYS if you have it installed). You'll also need Visual Studio 2013 or
-newer with the C++ tools. Then all you need to do is to kick off rustbuild.
-
-```
-python .\src\bootstrap\bootstrap.py
-```
-
-Currently rustbuild only works with some known versions of Visual Studio. If you
-have a more recent version installed that a part of rustbuild doesn't understand
+Currently building Rust only works with some known versions of Visual Studio. If
+you have a more recent version installed the build system doesn't understand
 then you may need to force rustbuild to use an older version. This can be done
 by manually calling the appropriate vcvars file before running the bootstrap.
 
 ```
 CALL "C:\Program Files (x86)\Microsoft Visual Studio 14.0\VC\bin\amd64\vcvars64.bat"
-python .\src\bootstrap\bootstrap.py
+python x.py build
 ```
+
+#### Specifying an ABI
+
+Each specific ABI can also be used from either environment (for example, using
+the GNU ABI in powershell) by using an explicit build triple. The available
+Windows build triples are:
+- GNU ABI (using GCC)
+    - `i686-pc-windows-gnu`
+    - `x86_64-pc-windows-gnu`
+- The MSVC ABI
+    - `i686-pc-windows-msvc`
+    - `x86_64-pc-windows-msvc`
+
+The build triple can be specified by either specifying `--build=ABI` when
+invoking `x.py` commands, or by copying the `config.toml` file (as described
+in Building From Source), and modifying the `build` option under the `[build]`
+section.
+
+### Configure and Make
+
+While it's not the recommended build system, this project also provides a
+configure script and makefile (the latter of which just invokes `x.py`).
+
+```sh
+$ ./configure
+$ make && sudo make install
+```
+
+When using the configure script, the generated `config.mk` file may override the
+`config.toml` file. To go back to the `config.toml` file, delete the generated
+`config.mk` file.
 
 ## Building Documentation
 
 If you’d like to build the documentation, it’s almost the same:
 
 ```sh
-$ ./configure
-$ make docs
+$ ./x.py doc
 ```
 
-Building the documentation requires building the compiler, so the above
-details will apply. Once you have the compiler built, you can
-
-```sh
-$ make docs NO_REBUILD=1
-```
-
-To make sure you don’t re-build the compiler because you made a change
-to some documentation.
-
-The generated documentation will appear in a top-level `doc` directory,
-created by the `make` rule.
+The generated documentation will appear under `doc` in the `build` directory for
+the ABI used. I.e., if the ABI was `x86_64-pc-windows-msvc`, the directory will be
+`build\x86_64-pc-windows-msvc\doc`.
 
 ## Notes
 
@@ -195,8 +198,8 @@ The Rust community congregates in a few places:
 * [users.rust-lang.org] - General discussion and broader questions.
 * [/r/rust] - News and general discussion.
 
-[Stack Overflow]: http://stackoverflow.com/questions/tagged/rust
-[/r/rust]: http://reddit.com/r/rust
+[Stack Overflow]: https://stackoverflow.com/questions/tagged/rust
+[/r/rust]: https://reddit.com/r/rust
 [users.rust-lang.org]: https://users.rust-lang.org/
 
 ## Contributing

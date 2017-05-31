@@ -41,10 +41,14 @@ pub fn check(build: &mut Build) {
         }
     }
     let have_cmd = |cmd: &OsStr| {
-        for path in env::split_paths(&path).map(|p| p.join(cmd)) {
-            if fs::metadata(&path).is_ok() ||
-               fs::metadata(path.with_extension("exe")).is_ok() {
-                return Some(path);
+        for path in env::split_paths(&path) {
+            let target = path.join(cmd);
+            let mut cmd_alt = cmd.to_os_string();
+            cmd_alt.push(".exe");
+            if target.is_file() ||
+               target.with_extension("exe").exists() ||
+               target.join(cmd_alt).exists() {
+                return Some(target);
             }
         }
         return None;
@@ -61,35 +65,55 @@ pub fn check(build: &mut Build) {
 
     // If we've got a git directory we're gona need git to update
     // submodules and learn about various other aspects.
-    if fs::metadata(build.src.join(".git")).is_ok() {
+    if build.src_is_git {
         need_cmd("git".as_ref());
     }
 
-    // We need cmake, but only if we're actually building LLVM
-    for host in build.config.host.iter() {
-        if let Some(config) = build.config.target_config.get(host) {
-            if config.llvm_config.is_some() {
-                continue
-            }
-        }
+    // We need cmake, but only if we're actually building LLVM or sanitizers.
+    let building_llvm = build.config.host.iter()
+        .filter_map(|host| build.config.target_config.get(host))
+        .any(|config| config.llvm_config.is_none());
+    if building_llvm || build.config.sanitizers {
         need_cmd("cmake".as_ref());
-        if build.config.ninja {
-            need_cmd("ninja".as_ref())
+    }
+
+    // Ninja is currently only used for LLVM itself.
+    if building_llvm && build.config.ninja {
+        // Some Linux distros rename `ninja` to `ninja-build`.
+        // CMake can work with either binary name.
+        if have_cmd("ninja-build".as_ref()).is_none() {
+            need_cmd("ninja".as_ref());
         }
-        break
     }
 
-    need_cmd("python".as_ref());
-
-    // Look for the nodejs command, needed for emscripten testing
-    if let Some(node) = have_cmd("node".as_ref()) {
-        build.config.nodejs = Some(node);
-    } else if let Some(node) = have_cmd("nodejs".as_ref()) {
-        build.config.nodejs = Some(node);
+    if build.config.python.is_none() {
+        build.config.python = have_cmd("python2.7".as_ref());
     }
+    if build.config.python.is_none() {
+        build.config.python = have_cmd("python2".as_ref());
+    }
+    if build.config.python.is_none() {
+        need_cmd("python".as_ref());
+        build.config.python = Some("python".into());
+    }
+    need_cmd(build.config.python.as_ref().unwrap().as_ref());
+
 
     if let Some(ref s) = build.config.nodejs {
         need_cmd(s.as_ref());
+    } else {
+        // Look for the nodejs command, needed for emscripten testing
+        if let Some(node) = have_cmd("node".as_ref()) {
+            build.config.nodejs = Some(node);
+        } else if let Some(node) = have_cmd("nodejs".as_ref()) {
+            build.config.nodejs = Some(node);
+        }
+    }
+
+    if let Some(ref gdb) = build.config.gdb {
+        need_cmd(gdb.as_ref());
+    } else {
+        build.config.gdb = have_cmd("gdb".as_ref());
     }
 
     // We're gonna build some custom C code here and there, host triples
@@ -122,14 +146,14 @@ pub fn check(build: &mut Build) {
     // Externally configured LLVM requires FileCheck to exist
     let filecheck = build.llvm_filecheck(&build.config.build);
     if !filecheck.starts_with(&build.out) && !filecheck.exists() && build.config.codegen_tests {
-        panic!("filecheck executable {:?} does not exist", filecheck);
+        panic!("FileCheck executable {:?} does not exist", filecheck);
     }
 
     for target in build.config.target.iter() {
-        // Can't compile for iOS unless we're on OSX
+        // Can't compile for iOS unless we're on macOS
         if target.contains("apple-ios") &&
            !build.config.build.contains("apple-darwin") {
-            panic!("the iOS target is only supported on OSX");
+            panic!("the iOS target is only supported on macOS");
         }
 
         // Make sure musl-root is valid if specified
@@ -173,10 +197,6 @@ $ pacman -R cmake && pacman -S mingw-w64-x86_64-cmake
 ");
             }
         }
-
-        if target.contains("arm-linux-android") {
-            need_cmd("adb".as_ref());
-        }
     }
 
     for host in build.flags.host.iter() {
@@ -198,9 +218,12 @@ $ pacman -R cmake && pacman -S mingw-w64-x86_64-cmake
                    .to_string()
         })
     };
-    build.gdb_version = run(Command::new("gdb").arg("--version")).ok();
     build.lldb_version = run(Command::new("lldb").arg("--version")).ok();
     if build.lldb_version.is_some() {
         build.lldb_python_dir = run(Command::new("lldb").arg("-P")).ok();
+    }
+
+    if let Some(ref s) = build.config.ccache {
+        need_cmd(s.as_ref());
     }
 }

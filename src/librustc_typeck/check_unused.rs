@@ -9,56 +9,67 @@
 // except according to those terms.
 
 use lint;
-use rustc::dep_graph::DepNode;
 use rustc::ty::TyCtxt;
 
 use syntax::ast;
 use syntax_pos::{Span, DUMMY_SP};
 
 use rustc::hir;
-use rustc::hir::intravisit::Visitor;
+use rustc::hir::itemlikevisit::ItemLikeVisitor;
+use rustc::util::nodemap::DefIdSet;
 
-struct UnusedTraitImportVisitor<'a, 'tcx: 'a> {
+struct CheckVisitor<'a, 'tcx: 'a> {
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
+    used_trait_imports: DefIdSet,
 }
 
-impl<'a, 'tcx> UnusedTraitImportVisitor<'a, 'tcx> {
+impl<'a, 'tcx> CheckVisitor<'a, 'tcx> {
     fn check_import(&self, id: ast::NodeId, span: Span) {
         if !self.tcx.maybe_unused_trait_imports.contains(&id) {
             return;
         }
-        if self.tcx.used_trait_imports.borrow().contains(&id) {
+
+        let import_def_id = self.tcx.hir.local_def_id(id);
+        if self.used_trait_imports.contains(&import_def_id) {
             return;
         }
-        self.tcx.sess.add_lint(lint::builtin::UNUSED_IMPORTS,
-                               id,
-                               span,
-                               "unused import".to_string());
+
+        let msg = if let Ok(snippet) = self.tcx.sess.codemap().span_to_snippet(span) {
+            format!("unused import: `{}`", snippet)
+        } else {
+            "unused import".to_string()
+        };
+        self.tcx.sess.add_lint(lint::builtin::UNUSED_IMPORTS, id, span, msg);
     }
 }
 
-impl<'a, 'tcx, 'v> Visitor<'v> for UnusedTraitImportVisitor<'a, 'tcx> {
+impl<'a, 'tcx, 'v> ItemLikeVisitor<'v> for CheckVisitor<'a, 'tcx> {
     fn visit_item(&mut self, item: &hir::Item) {
         if item.vis == hir::Public || item.span == DUMMY_SP {
             return;
         }
-        if let hir::ItemUse(ref path) = item.node {
-            match path.node {
-                hir::ViewPathSimple(..) | hir::ViewPathGlob(..) => {
-                    self.check_import(item.id, path.span);
-                }
-                hir::ViewPathList(_, ref path_list) => {
-                    for path_item in path_list {
-                        self.check_import(path_item.node.id, path_item.span);
-                    }
-                }
-            }
+        if let hir::ItemUse(ref path, _) = item.node {
+            self.check_import(item.id, path.span);
         }
+    }
+
+    fn visit_trait_item(&mut self, _trait_item: &hir::TraitItem) {
+    }
+
+    fn visit_impl_item(&mut self, _impl_item: &hir::ImplItem) {
     }
 }
 
 pub fn check_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
-    let _task = tcx.dep_graph.in_task(DepNode::UnusedTraitCheck);
-    let mut visitor = UnusedTraitImportVisitor { tcx: tcx };
-    tcx.map.krate().visit_all_items(&mut visitor);
+    let mut used_trait_imports = DefIdSet();
+    for &body_id in tcx.hir.krate().bodies.keys() {
+        let item_def_id = tcx.hir.body_owner_def_id(body_id);
+        let tables = tcx.typeck_tables_of(item_def_id);
+        let imports = &tables.used_trait_imports;
+        debug!("GatherVisitor: item_def_id={:?} with imports {:#?}", item_def_id, imports);
+        used_trait_imports.extend(imports);
+    }
+
+    let mut visitor = CheckVisitor { tcx, used_trait_imports };
+    tcx.hir.krate().visit_all_item_likes(&mut visitor);
 }

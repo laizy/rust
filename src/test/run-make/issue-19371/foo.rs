@@ -15,6 +15,7 @@ extern crate rustc_driver;
 extern crate rustc_lint;
 extern crate rustc_metadata;
 extern crate rustc_errors;
+extern crate rustc_trans;
 extern crate syntax;
 
 use rustc::dep_graph::DepGraph;
@@ -25,6 +26,7 @@ use rustc_driver::driver::{compile_input, CompileController, anon_src};
 use rustc_metadata::cstore::CStore;
 use rustc_errors::registry::Registry;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -57,22 +59,17 @@ fn basic_sess(sysroot: PathBuf) -> (Session, Rc<CStore>) {
 
     let descriptions = Registry::new(&rustc::DIAGNOSTICS);
     let dep_graph = DepGraph::new(opts.build_dep_graph());
-    let cstore = Rc::new(CStore::new(&dep_graph));
+    let cstore = Rc::new(CStore::new(&dep_graph, Box::new(rustc_trans::LlvmMetadataLoader)));
     let sess = build_session(opts, &dep_graph, None, descriptions, cstore.clone());
+    rustc_trans::init(&sess);
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
     (sess, cstore)
 }
 
 fn compile(code: String, output: PathBuf, sysroot: PathBuf) {
     let (sess, cstore) = basic_sess(sysroot);
-    let cfg = build_configuration(&sess, vec![]);
+    let cfg = build_configuration(&sess, HashSet::new());
     let control = CompileController::basic();
-
-    compile_input(&sess, &cstore,
-            cfg,
-            &Input::Str { name: anon_src(), input: code },
-            &None,
-            &Some(output),
-            None,
-            &control);
+    let input = Input::Str { name: anon_src(), input: code };
+    compile_input(&sess, &cstore, &input, &None, &Some(output), None, &control);
 }

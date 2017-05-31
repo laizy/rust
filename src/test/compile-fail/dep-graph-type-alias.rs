@@ -23,27 +23,35 @@ fn main() { }
 #[rustc_if_this_changed]
 type TypeAlias = u32;
 
-#[rustc_then_this_would_need(ItemSignature)] //~ ERROR OK
+// The type alias directly affects the type of the field,
+// not the enclosing struct:
+#[rustc_then_this_would_need(ItemSignature)] //~ ERROR no path
 struct Struct {
+    #[rustc_then_this_would_need(ItemSignature)] //~ ERROR OK
     x: TypeAlias,
     y: u32
 }
 
-#[rustc_then_this_would_need(ItemSignature)] //~ ERROR OK
+#[rustc_then_this_would_need(ItemSignature)] //~ ERROR no path
 enum Enum {
-    Variant1(TypeAlias),
+    Variant1 {
+        #[rustc_then_this_would_need(ItemSignature)] //~ ERROR OK
+        t: TypeAlias
+    },
     Variant2(i32)
 }
 
-#[rustc_then_this_would_need(ItemSignature)] //~ ERROR OK
+#[rustc_then_this_would_need(ItemSignature)] //~ ERROR no path
 trait Trait {
+    #[rustc_then_this_would_need(ItemSignature)] //~ ERROR OK
     fn method(&self, _: TypeAlias);
 }
 
 struct SomeType;
 
-#[rustc_then_this_would_need(ItemSignature)] //~ ERROR OK
+#[rustc_then_this_would_need(ItemSignature)] //~ ERROR no path
 impl SomeType {
+    #[rustc_then_this_would_need(ItemSignature)] //~ ERROR OK
     fn method(&self, _: TypeAlias) {}
 }
 

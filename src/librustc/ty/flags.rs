@@ -11,6 +11,7 @@
 use ty::subst::Substs;
 use ty::{self, Ty, TypeFlags, TypeFoldable};
 
+#[derive(Debug)]
 pub struct FlagComputation {
     pub flags: TypeFlags,
 
@@ -87,8 +88,7 @@ impl FlagComputation {
             &ty::TyClosure(_, ref substs) => {
                 self.add_flags(TypeFlags::HAS_TY_CLOSURE);
                 self.add_flags(TypeFlags::HAS_LOCAL_NAMES);
-                self.add_substs(&substs.func_substs);
-                self.add_tys(&substs.upvar_tys);
+                self.add_substs(&substs.substs);
             }
 
             &ty::TyInfer(infer) => {
@@ -121,19 +121,24 @@ impl FlagComputation {
                 self.add_substs(substs);
             }
 
-            &ty::TyTrait(ref obj) => {
+            &ty::TyDynamic(ref obj, r) => {
                 let mut computation = FlagComputation::new();
-                computation.add_substs(obj.principal.skip_binder().substs);
-                for projection_bound in &obj.projection_bounds {
-                    let mut proj_computation = FlagComputation::new();
-                    proj_computation.add_existential_projection(&projection_bound.0);
-                    self.add_bound_computation(&proj_computation);
+                for predicate in obj.skip_binder().iter() {
+                    match *predicate {
+                        ty::ExistentialPredicate::Trait(tr) => computation.add_substs(tr.substs),
+                        ty::ExistentialPredicate::Projection(p) => {
+                            let mut proj_computation = FlagComputation::new();
+                            proj_computation.add_existential_projection(&p);
+                            self.add_bound_computation(&proj_computation);
+                        }
+                        ty::ExistentialPredicate::AutoTrait(_) => {}
+                    }
                 }
                 self.add_bound_computation(&computation);
-                self.add_region(obj.region_bound);
+                self.add_region(r);
             }
 
-            &ty::TyBox(tt) | &ty::TyArray(tt, _) | &ty::TySlice(tt) => {
+            &ty::TyArray(tt, _) | &ty::TySlice(tt) => {
                 self.add_ty(tt)
             }
 
@@ -146,23 +151,23 @@ impl FlagComputation {
                 self.add_ty(m.ty);
             }
 
-            &ty::TyTuple(ref ts) => {
+            &ty::TyTuple(ref ts, _) => {
                 self.add_tys(&ts[..]);
             }
 
-            &ty::TyFnDef(_, substs, ref f) => {
+            &ty::TyFnDef(_, substs, f) => {
                 self.add_substs(substs);
-                self.add_fn_sig(&f.sig);
+                self.add_fn_sig(f);
             }
 
-            &ty::TyFnPtr(ref f) => {
-                self.add_fn_sig(&f.sig);
+            &ty::TyFnPtr(f) => {
+                self.add_fn_sig(f);
             }
         }
     }
 
     fn add_ty(&mut self, ty: Ty) {
-        self.add_flags(ty.flags.get());
+        self.add_flags(ty.flags);
         self.add_depth(ty.region_depth);
     }
 
@@ -172,34 +177,19 @@ impl FlagComputation {
         }
     }
 
-    fn add_fn_sig(&mut self, fn_sig: &ty::PolyFnSig) {
+    fn add_fn_sig(&mut self, fn_sig: ty::PolyFnSig) {
         let mut computation = FlagComputation::new();
 
-        computation.add_tys(&fn_sig.0.inputs);
-        computation.add_ty(fn_sig.0.output);
+        computation.add_tys(fn_sig.skip_binder().inputs());
+        computation.add_ty(fn_sig.skip_binder().output());
 
         self.add_bound_computation(&computation);
     }
 
-    fn add_region(&mut self, r: &ty::Region) {
-        match *r {
-            ty::ReVar(..) => {
-                self.add_flags(TypeFlags::HAS_RE_INFER);
-                self.add_flags(TypeFlags::KEEP_IN_LOCAL_TCX);
-            }
-            ty::ReSkolemized(..) => {
-                self.add_flags(TypeFlags::HAS_RE_INFER);
-                self.add_flags(TypeFlags::HAS_RE_SKOL);
-                self.add_flags(TypeFlags::KEEP_IN_LOCAL_TCX);
-            }
-            ty::ReLateBound(debruijn, _) => { self.add_depth(debruijn.depth); }
-            ty::ReEarlyBound(..) => { self.add_flags(TypeFlags::HAS_RE_EARLY_BOUND); }
-            ty::ReStatic | ty::ReErased => {}
-            _ => { self.add_flags(TypeFlags::HAS_FREE_REGIONS); }
-        }
-
-        if !r.is_global() {
-            self.add_flags(TypeFlags::HAS_LOCAL_NAMES);
+    fn add_region(&mut self, r: ty::Region) {
+        self.add_flags(r.type_flags());
+        if let ty::ReLateBound(debruijn, _) = *r {
+            self.add_depth(debruijn.depth);
         }
     }
 

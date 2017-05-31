@@ -46,81 +46,499 @@
             issue = "0")]
 #![allow(missing_docs)]
 
-extern "rust-intrinsic" {
+#[stable(feature = "drop_in_place", since = "1.8.0")]
+#[rustc_deprecated(reason = "no longer an intrinsic - use `ptr::drop_in_place` directly",
+                   since = "1.18.0")]
+pub use ptr::drop_in_place;
 
+extern "rust-intrinsic" {
     // NB: These intrinsics take raw pointers because they mutate aliased
     // memory, which is not valid for either `&` or `&mut`.
 
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange` method by passing
+    /// [`Ordering::SeqCst`](../../std/sync/atomic/enum.Ordering.html)
+    /// as both the `success` and `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange`][compare_exchange].
+    ///
+    /// [compare_exchange]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange
     pub fn atomic_cxchg<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange` method by passing
+    /// [`Ordering::Acquire`](../../std/sync/atomic/enum.Ordering.html)
+    /// as both the `success` and `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange`][compare_exchange].
+    ///
+    /// [compare_exchange]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange
     pub fn atomic_cxchg_acq<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange` method by passing
+    /// [`Ordering::Release`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `success` and
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange`][compare_exchange].
+    ///
+    /// [compare_exchange]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange
     pub fn atomic_cxchg_rel<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange` method by passing
+    /// [`Ordering::AcqRel`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `success` and
+    /// [`Ordering::Acquire`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange`][compare_exchange].
+    ///
+    /// [compare_exchange]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange
     pub fn atomic_cxchg_acqrel<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange` method by passing
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as both the `success` and `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange`][compare_exchange].
+    ///
+    /// [compare_exchange]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange
     pub fn atomic_cxchg_relaxed<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange` method by passing
+    /// [`Ordering::SeqCst`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `success` and
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange`][compare_exchange].
+    ///
+    /// [compare_exchange]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange
     pub fn atomic_cxchg_failrelaxed<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange` method by passing
+    /// [`Ordering::SeqCst`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `success` and
+    /// [`Ordering::Acquire`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange`][compare_exchange].
+    ///
+    /// [compare_exchange]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange
     pub fn atomic_cxchg_failacq<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange` method by passing
+    /// [`Ordering::Acquire`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `success` and
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange`][compare_exchange].
+    ///
+    /// [compare_exchange]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange
     pub fn atomic_cxchg_acq_failrelaxed<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange` method by passing
+    /// [`Ordering::AcqRel`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `success` and
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange`][compare_exchange].
+    ///
+    /// [compare_exchange]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange
     pub fn atomic_cxchg_acqrel_failrelaxed<T>(dst: *mut T, old: T, src: T) -> (T, bool);
 
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange_weak` method by passing
+    /// [`Ordering::SeqCst`](../../std/sync/atomic/enum.Ordering.html)
+    /// as both the `success` and `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange_weak`][cew].
+    ///
+    /// [cew]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange_weak
     pub fn atomic_cxchgweak<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange_weak` method by passing
+    /// [`Ordering::Acquire`](../../std/sync/atomic/enum.Ordering.html)
+    /// as both the `success` and `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange_weak`][cew].
+    ///
+    /// [cew]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange_weak
     pub fn atomic_cxchgweak_acq<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange_weak` method by passing
+    /// [`Ordering::Release`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `success` and
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange_weak`][cew].
+    ///
+    /// [cew]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange_weak
     pub fn atomic_cxchgweak_rel<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange_weak` method by passing
+    /// [`Ordering::AcqRel`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `success` and
+    /// [`Ordering::Acquire`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange_weak`][cew].
+    ///
+    /// [cew]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange_weak
     pub fn atomic_cxchgweak_acqrel<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange_weak` method by passing
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as both the `success` and `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange_weak`][cew].
+    ///
+    /// [cew]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange_weak
     pub fn atomic_cxchgweak_relaxed<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange_weak` method by passing
+    /// [`Ordering::SeqCst`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `success` and
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange_weak`][cew].
+    ///
+    /// [cew]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange_weak
     pub fn atomic_cxchgweak_failrelaxed<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange_weak` method by passing
+    /// [`Ordering::SeqCst`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `success` and
+    /// [`Ordering::Acquire`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange_weak`][cew].
+    ///
+    /// [cew]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange_weak
     pub fn atomic_cxchgweak_failacq<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange_weak` method by passing
+    /// [`Ordering::Acquire`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `success` and
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange_weak`][cew].
+    ///
+    /// [cew]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange_weak
     pub fn atomic_cxchgweak_acq_failrelaxed<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+    /// Stores a value if the current value is the same as the `old` value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `compare_exchange_weak` method by passing
+    /// [`Ordering::AcqRel`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `success` and
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `failure` parameters. For example,
+    /// [`AtomicBool::compare_exchange_weak`][cew].
+    ///
+    /// [cew]: ../../std/sync/atomic/struct.AtomicBool.html#method.compare_exchange_weak
     pub fn atomic_cxchgweak_acqrel_failrelaxed<T>(dst: *mut T, old: T, src: T) -> (T, bool);
 
+    /// Loads the current value of the pointer.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `load` method by passing
+    /// [`Ordering::SeqCst`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::load`](../../std/sync/atomic/struct.AtomicBool.html#method.load).
     pub fn atomic_load<T>(src: *const T) -> T;
+    /// Loads the current value of the pointer.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `load` method by passing
+    /// [`Ordering::Acquire`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::load`](../../std/sync/atomic/struct.AtomicBool.html#method.load).
     pub fn atomic_load_acq<T>(src: *const T) -> T;
+    /// Loads the current value of the pointer.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `load` method by passing
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::load`](../../std/sync/atomic/struct.AtomicBool.html#method.load).
     pub fn atomic_load_relaxed<T>(src: *const T) -> T;
     pub fn atomic_load_unordered<T>(src: *const T) -> T;
 
+    /// Stores the value at the specified memory location.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `store` method by passing
+    /// [`Ordering::SeqCst`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::store`](../../std/sync/atomic/struct.AtomicBool.html#method.store).
     pub fn atomic_store<T>(dst: *mut T, val: T);
+    /// Stores the value at the specified memory location.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `store` method by passing
+    /// [`Ordering::Release`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::store`](../../std/sync/atomic/struct.AtomicBool.html#method.store).
     pub fn atomic_store_rel<T>(dst: *mut T, val: T);
+    /// Stores the value at the specified memory location.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `store` method by passing
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::store`](../../std/sync/atomic/struct.AtomicBool.html#method.store).
     pub fn atomic_store_relaxed<T>(dst: *mut T, val: T);
     pub fn atomic_store_unordered<T>(dst: *mut T, val: T);
 
+    /// Stores the value at the specified memory location, returning the old value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `swap` method by passing
+    /// [`Ordering::SeqCst`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::swap`](../../std/sync/atomic/struct.AtomicBool.html#method.swap).
     pub fn atomic_xchg<T>(dst: *mut T, src: T) -> T;
+    /// Stores the value at the specified memory location, returning the old value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `swap` method by passing
+    /// [`Ordering::Acquire`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::swap`](../../std/sync/atomic/struct.AtomicBool.html#method.swap).
     pub fn atomic_xchg_acq<T>(dst: *mut T, src: T) -> T;
+    /// Stores the value at the specified memory location, returning the old value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `swap` method by passing
+    /// [`Ordering::Release`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::swap`](../../std/sync/atomic/struct.AtomicBool.html#method.swap).
     pub fn atomic_xchg_rel<T>(dst: *mut T, src: T) -> T;
+    /// Stores the value at the specified memory location, returning the old value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `swap` method by passing
+    /// [`Ordering::AcqRel`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::swap`](../../std/sync/atomic/struct.AtomicBool.html#method.swap).
     pub fn atomic_xchg_acqrel<T>(dst: *mut T, src: T) -> T;
+    /// Stores the value at the specified memory location, returning the old value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `swap` method by passing
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::swap`](../../std/sync/atomic/struct.AtomicBool.html#method.swap).
     pub fn atomic_xchg_relaxed<T>(dst: *mut T, src: T) -> T;
 
+    /// Add to the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_add` method by passing
+    /// [`Ordering::SeqCst`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicIsize::fetch_add`](../../std/sync/atomic/struct.AtomicIsize.html#method.fetch_add).
     pub fn atomic_xadd<T>(dst: *mut T, src: T) -> T;
+    /// Add to the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_add` method by passing
+    /// [`Ordering::Acquire`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicIsize::fetch_add`](../../std/sync/atomic/struct.AtomicIsize.html#method.fetch_add).
     pub fn atomic_xadd_acq<T>(dst: *mut T, src: T) -> T;
+    /// Add to the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_add` method by passing
+    /// [`Ordering::Release`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicIsize::fetch_add`](../../std/sync/atomic/struct.AtomicIsize.html#method.fetch_add).
     pub fn atomic_xadd_rel<T>(dst: *mut T, src: T) -> T;
+    /// Add to the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_add` method by passing
+    /// [`Ordering::AcqRel`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicIsize::fetch_add`](../../std/sync/atomic/struct.AtomicIsize.html#method.fetch_add).
     pub fn atomic_xadd_acqrel<T>(dst: *mut T, src: T) -> T;
+    /// Add to the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_add` method by passing
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicIsize::fetch_add`](../../std/sync/atomic/struct.AtomicIsize.html#method.fetch_add).
     pub fn atomic_xadd_relaxed<T>(dst: *mut T, src: T) -> T;
 
+    /// Subtract from the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_sub` method by passing
+    /// [`Ordering::SeqCst`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicIsize::fetch_sub`](../../std/sync/atomic/struct.AtomicIsize.html#method.fetch_sub).
     pub fn atomic_xsub<T>(dst: *mut T, src: T) -> T;
+    /// Subtract from the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_sub` method by passing
+    /// [`Ordering::Acquire`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicIsize::fetch_sub`](../../std/sync/atomic/struct.AtomicIsize.html#method.fetch_sub).
     pub fn atomic_xsub_acq<T>(dst: *mut T, src: T) -> T;
+    /// Subtract from the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_sub` method by passing
+    /// [`Ordering::Release`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicIsize::fetch_sub`](../../std/sync/atomic/struct.AtomicIsize.html#method.fetch_sub).
     pub fn atomic_xsub_rel<T>(dst: *mut T, src: T) -> T;
+    /// Subtract from the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_sub` method by passing
+    /// [`Ordering::AcqRel`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicIsize::fetch_sub`](../../std/sync/atomic/struct.AtomicIsize.html#method.fetch_sub).
     pub fn atomic_xsub_acqrel<T>(dst: *mut T, src: T) -> T;
+    /// Subtract from the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_sub` method by passing
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicIsize::fetch_sub`](../../std/sync/atomic/struct.AtomicIsize.html#method.fetch_sub).
     pub fn atomic_xsub_relaxed<T>(dst: *mut T, src: T) -> T;
 
+    /// Bitwise and with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_and` method by passing
+    /// [`Ordering::SeqCst`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_and`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_and).
     pub fn atomic_and<T>(dst: *mut T, src: T) -> T;
+    /// Bitwise and with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_and` method by passing
+    /// [`Ordering::Acquire`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_and`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_and).
     pub fn atomic_and_acq<T>(dst: *mut T, src: T) -> T;
+    /// Bitwise and with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_and` method by passing
+    /// [`Ordering::Release`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_and`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_and).
     pub fn atomic_and_rel<T>(dst: *mut T, src: T) -> T;
+    /// Bitwise and with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_and` method by passing
+    /// [`Ordering::AcqRel`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_and`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_and).
     pub fn atomic_and_acqrel<T>(dst: *mut T, src: T) -> T;
+    /// Bitwise and with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_and` method by passing
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_and`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_and).
     pub fn atomic_and_relaxed<T>(dst: *mut T, src: T) -> T;
 
+    /// Bitwise nand with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic::AtomicBool` type via the `fetch_nand` method by passing
+    /// [`Ordering::SeqCst`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_nand`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_nand).
     pub fn atomic_nand<T>(dst: *mut T, src: T) -> T;
+    /// Bitwise nand with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic::AtomicBool` type via the `fetch_nand` method by passing
+    /// [`Ordering::Acquire`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_nand`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_nand).
     pub fn atomic_nand_acq<T>(dst: *mut T, src: T) -> T;
+    /// Bitwise nand with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic::AtomicBool` type via the `fetch_nand` method by passing
+    /// [`Ordering::Release`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_nand`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_nand).
     pub fn atomic_nand_rel<T>(dst: *mut T, src: T) -> T;
+    /// Bitwise nand with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic::AtomicBool` type via the `fetch_nand` method by passing
+    /// [`Ordering::AcqRel`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_nand`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_nand).
     pub fn atomic_nand_acqrel<T>(dst: *mut T, src: T) -> T;
+    /// Bitwise nand with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic::AtomicBool` type via the `fetch_nand` method by passing
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_nand`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_nand).
     pub fn atomic_nand_relaxed<T>(dst: *mut T, src: T) -> T;
 
+    /// Bitwise or with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_or` method by passing
+    /// [`Ordering::SeqCst`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_or`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_or).
     pub fn atomic_or<T>(dst: *mut T, src: T) -> T;
+    /// Bitwise or with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_or` method by passing
+    /// [`Ordering::Acquire`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_or`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_or).
     pub fn atomic_or_acq<T>(dst: *mut T, src: T) -> T;
+    /// Bitwise or with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_or` method by passing
+    /// [`Ordering::Release`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_or`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_or).
     pub fn atomic_or_rel<T>(dst: *mut T, src: T) -> T;
+    /// Bitwise or with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_or` method by passing
+    /// [`Ordering::AcqRel`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_or`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_or).
     pub fn atomic_or_acqrel<T>(dst: *mut T, src: T) -> T;
+    /// Bitwise or with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_or` method by passing
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_or`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_or).
     pub fn atomic_or_relaxed<T>(dst: *mut T, src: T) -> T;
 
+    /// Bitwise xor with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_xor` method by passing
+    /// [`Ordering::SeqCst`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_xor`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_xor).
     pub fn atomic_xor<T>(dst: *mut T, src: T) -> T;
+    /// Bitwise xor with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_xor` method by passing
+    /// [`Ordering::Acquire`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_xor`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_xor).
     pub fn atomic_xor_acq<T>(dst: *mut T, src: T) -> T;
+    /// Bitwise xor with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_xor` method by passing
+    /// [`Ordering::Release`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_xor`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_xor).
     pub fn atomic_xor_rel<T>(dst: *mut T, src: T) -> T;
+    /// Bitwise xor with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_xor` method by passing
+    /// [`Ordering::AcqRel`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_xor`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_xor).
     pub fn atomic_xor_acqrel<T>(dst: *mut T, src: T) -> T;
+    /// Bitwise xor with the current value, returning the previous value.
+    /// The stabilized version of this intrinsic is available on the
+    /// `std::sync::atomic` types via the `fetch_xor` method by passing
+    /// [`Ordering::Relaxed`](../../std/sync/atomic/enum.Ordering.html)
+    /// as the `order`. For example,
+    /// [`AtomicBool::fetch_xor`](../../std/sync/atomic/struct.AtomicBool.html#method.fetch_xor).
     pub fn atomic_xor_relaxed<T>(dst: *mut T, src: T) -> T;
 
     pub fn atomic_max<T>(dst: *mut T, src: T) -> T;
@@ -226,26 +644,6 @@ extern "rust-intrinsic" {
     pub fn size_of_val<T: ?Sized>(_: &T) -> usize;
     pub fn min_align_of_val<T: ?Sized>(_: &T) -> usize;
 
-    /// Executes the destructor (if any) of the pointed-to value.
-    ///
-    /// This has two use cases:
-    ///
-    /// * It is *required* to use `drop_in_place` to drop unsized types like
-    ///   trait objects, because they can't be read out onto the stack and
-    ///   dropped normally.
-    ///
-    /// * It is friendlier to the optimizer to do this over `ptr::read` when
-    ///   dropping manually allocated memory (e.g. when writing Box/Rc/Vec),
-    ///   as the compiler doesn't need to prove that it's sound to elide the
-    ///   copy.
-    ///
-    /// # Undefined Behavior
-    ///
-    /// This has all the same safety problems as `ptr::read` with respect to
-    /// invalid pointers, types, and double drops.
-    #[stable(feature = "drop_in_place", since = "1.8.0")]
-    pub fn drop_in_place<T: ?Sized>(to_drop: *mut T);
-
     /// Gets a static string slice containing the name of a type.
     pub fn type_name<T: ?Sized>() -> &'static str;
 
@@ -271,9 +669,6 @@ extern "rust-intrinsic" {
     /// initialize memory previous set to the result of `uninit`.
     pub fn uninit<T>() -> T;
 
-    /// Moves a value out of scope without running drop glue.
-    pub fn forget<T>(_: T) -> ();
-
     /// Reinterprets the bits of a value of one type as another type.
     ///
     /// Both types must have the same size. Neither the original, nor the result,
@@ -291,7 +686,7 @@ extern "rust-intrinsic" {
     /// The [nomicon](../../nomicon/transmutes.html) has additional
     /// documentation.
     ///
-    /// [ub]: ../../reference.html#behavior-considered-undefined
+    /// [ub]: ../../reference/behavior-considered-undefined.html
     ///
     /// # Examples
     ///
@@ -631,8 +1026,12 @@ extern "rust-intrinsic" {
     pub fn volatile_set_memory<T>(dst: *mut T, val: u8, count: usize);
 
     /// Perform a volatile load from the `src` pointer.
+    /// The stabilized version of this intrinsic is
+    /// [`std::ptr::read_volatile`](../../std/ptr/fn.read_volatile.html).
     pub fn volatile_load<T>(src: *const T) -> T;
     /// Perform a volatile store to the `dst` pointer.
+    /// The stabilized version of this intrinsic is
+    /// [`std::ptr::write_volatile`](../../std/ptr/fn.write_volatile.html).
     pub fn volatile_store<T>(dst: *mut T, val: T);
 
     /// Returns the square root of an `f32`
@@ -756,22 +1155,79 @@ extern "rust-intrinsic" {
     /// Returns the number of bits set in an integer type `T`
     pub fn ctpop<T>(x: T) -> T;
 
-    /// Returns the number of leading bits unset in an integer type `T`
+    /// Returns the number of leading unset bits (zeroes) in an integer type `T`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(core_intrinsics)]
+    ///
+    /// use std::intrinsics::ctlz;
+    ///
+    /// let x = 0b0001_1100_u8;
+    /// let num_leading = unsafe { ctlz(x) };
+    /// assert_eq!(num_leading, 3);
+    /// ```
+    ///
+    /// An `x` with value `0` will return the bit width of `T`.
+    ///
+    /// ```
+    /// #![feature(core_intrinsics)]
+    ///
+    /// use std::intrinsics::ctlz;
+    ///
+    /// let x = 0u16;
+    /// let num_leading = unsafe { ctlz(x) };
+    /// assert_eq!(num_leading, 16);
+    /// ```
     pub fn ctlz<T>(x: T) -> T;
 
-    /// Returns the number of trailing bits unset in an integer type `T`
+    /// Returns the number of trailing unset bits (zeroes) in an integer type `T`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(core_intrinsics)]
+    ///
+    /// use std::intrinsics::cttz;
+    ///
+    /// let x = 0b0011_1000_u8;
+    /// let num_trailing = unsafe { cttz(x) };
+    /// assert_eq!(num_trailing, 3);
+    /// ```
+    ///
+    /// An `x` with value `0` will return the bit width of `T`:
+    ///
+    /// ```
+    /// #![feature(core_intrinsics)]
+    ///
+    /// use std::intrinsics::cttz;
+    ///
+    /// let x = 0u16;
+    /// let num_trailing = unsafe { cttz(x) };
+    /// assert_eq!(num_trailing, 16);
+    /// ```
     pub fn cttz<T>(x: T) -> T;
 
     /// Reverses the bytes in an integer type `T`.
     pub fn bswap<T>(x: T) -> T;
 
     /// Performs checked integer addition.
+    /// The stabilized versions of this intrinsic are available on the integer
+    /// primitives via the `overflowing_add` method. For example,
+    /// [`std::u32::overflowing_add`](../../std/primitive.u32.html#method.overflowing_add)
     pub fn add_with_overflow<T>(x: T, y: T) -> (T, bool);
 
     /// Performs checked integer subtraction
+    /// The stabilized versions of this intrinsic are available on the integer
+    /// primitives via the `overflowing_sub` method. For example,
+    /// [`std::u32::overflowing_sub`](../../std/primitive.u32.html#method.overflowing_sub)
     pub fn sub_with_overflow<T>(x: T, y: T) -> (T, bool);
 
     /// Performs checked integer multiplication
+    /// The stabilized versions of this intrinsic are available on the integer
+    /// primitives via the `overflowing_mul` method. For example,
+    /// [`std::u32::overflowing_mul`](../../std/primitive.u32.html#method.overflowing_mul)
     pub fn mul_with_overflow<T>(x: T, y: T) -> (T, bool);
 
     /// Performs an unchecked division, resulting in undefined behavior
@@ -781,11 +1237,27 @@ extern "rust-intrinsic" {
     /// undefined behavior where y = 0 or x = `T::min_value()` and y = -1
     pub fn unchecked_rem<T>(x: T, y: T) -> T;
 
-    /// Returns (a + b) mod 2^N, where N is the width of T in bits.
+    /// Performs an unchecked left shift, resulting in undefined behavior when
+    /// y < 0 or y >= N, where N is the width of T in bits.
+    pub fn unchecked_shl<T>(x: T, y: T) -> T;
+    /// Performs an unchecked right shift, resulting in undefined behavior when
+    /// y < 0 or y >= N, where N is the width of T in bits.
+    pub fn unchecked_shr<T>(x: T, y: T) -> T;
+
+    /// Returns (a + b) mod 2<sup>N</sup>, where N is the width of T in bits.
+    /// The stabilized versions of this intrinsic are available on the integer
+    /// primitives via the `wrapping_add` method. For example,
+    /// [`std::u32::wrapping_add`](../../std/primitive.u32.html#method.wrapping_add)
     pub fn overflowing_add<T>(a: T, b: T) -> T;
-    /// Returns (a - b) mod 2^N, where N is the width of T in bits.
+    /// Returns (a - b) mod 2<sup>N</sup>, where N is the width of T in bits.
+    /// The stabilized versions of this intrinsic are available on the integer
+    /// primitives via the `wrapping_sub` method. For example,
+    /// [`std::u32::wrapping_sub`](../../std/primitive.u32.html#method.wrapping_sub)
     pub fn overflowing_sub<T>(a: T, b: T) -> T;
-    /// Returns (a * b) mod 2^N, where N is the width of T in bits.
+    /// Returns (a * b) mod 2<sup>N</sup>, where N is the width of T in bits.
+    /// The stabilized versions of this intrinsic are available on the integer
+    /// primitives via the `wrapping_mul` method. For example,
+    /// [`std::u32::wrapping_mul`](../../std/primitive.u32.html#method.wrapping_mul)
     pub fn overflowing_mul<T>(a: T, b: T) -> T;
 
     /// Returns the value of the discriminant for the variant in 'v',

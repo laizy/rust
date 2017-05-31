@@ -9,10 +9,11 @@
 // except according to those terms.
 
 use rustc::dep_graph::DepNode;
-use rustc::hir::def_id::{CrateNum, DefId};
+use rustc::hir::def_id::{CrateNum, DefId, LOCAL_CRATE, CRATE_DEF_INDEX};
 use rustc::hir::svh::Svh;
+use rustc::ich::Fingerprint;
 use rustc::ty::TyCtxt;
-use rustc_data_structures::fnv::FnvHashMap;
+use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::flock;
 use rustc_serialize::Decodable;
 use rustc_serialize::opaque::Decoder;
@@ -22,11 +23,15 @@ use super::data::*;
 use super::fs::*;
 use super::file_format;
 
+use std::hash::Hash;
+use std::fmt::Debug;
+
 pub struct HashContext<'a, 'tcx: 'a> {
     pub tcx: TyCtxt<'a, 'tcx, 'tcx>,
     incremental_hashes_map: &'a IncrementalHashesMap,
-    item_metadata_hashes: FnvHashMap<DefId, u64>,
-    crate_hashes: FnvHashMap<CrateNum, Svh>,
+    item_metadata_hashes: FxHashMap<DefId, Fingerprint>,
+    crate_hashes: FxHashMap<CrateNum, Svh>,
+    global_metadata_hashes: FxHashMap<DepNode<DefId>, Fingerprint>,
 }
 
 impl<'a, 'tcx> HashContext<'a, 'tcx> {
@@ -36,35 +41,35 @@ impl<'a, 'tcx> HashContext<'a, 'tcx> {
         HashContext {
             tcx: tcx,
             incremental_hashes_map: incremental_hashes_map,
-            item_metadata_hashes: FnvHashMap(),
-            crate_hashes: FnvHashMap(),
+            item_metadata_hashes: FxHashMap(),
+            crate_hashes: FxHashMap(),
+            global_metadata_hashes: FxHashMap(),
         }
     }
 
     pub fn is_hashable(dep_node: &DepNode<DefId>) -> bool {
         match *dep_node {
             DepNode::Krate |
-            DepNode::Hir(_) => true,
-            DepNode::MetaData(def_id) => !def_id.is_local(),
+            DepNode::Hir(_) |
+            DepNode::HirBody(_) =>
+                true,
+            DepNode::MetaData(def_id) |
+            DepNode::GlobalMetaData(def_id, _) => !def_id.is_local(),
             _ => false,
         }
     }
 
-    pub fn hash(&mut self, dep_node: &DepNode<DefId>) -> Option<u64> {
+    pub fn hash(&mut self, dep_node: &DepNode<DefId>) -> Option<Fingerprint> {
         match *dep_node {
             DepNode::Krate => {
                 Some(self.incremental_hashes_map[dep_node])
             }
 
             // HIR nodes (which always come from our crate) are an input:
-            DepNode::Hir(def_id) => {
+            DepNode::Hir(def_id) |
+            DepNode::HirBody(def_id) => {
                 assert!(def_id.is_local(),
                         "cannot hash HIR for non-local def-id {:?} => {:?}",
-                        def_id,
-                        self.tcx.item_path_str(def_id));
-
-                assert!(!self.tcx.map.is_inlined_def_id(def_id),
-                        "cannot hash HIR for inlined def-id {:?} => {:?}",
                         def_id,
                         self.tcx.item_path_str(def_id));
 
@@ -76,7 +81,15 @@ impl<'a, 'tcx> HashContext<'a, 'tcx> {
             // don't hash them, but we do compute a hash for them and
             // save it for others to use.
             DepNode::MetaData(def_id) if !def_id.is_local() => {
-                Some(self.metadata_hash(def_id))
+                Some(self.metadata_hash(def_id,
+                                        def_id.krate,
+                                        |this| &mut this.item_metadata_hashes))
+            }
+
+            DepNode::GlobalMetaData(def_id, kind) => {
+                Some(self.metadata_hash(DepNode::GlobalMetaData(def_id, kind),
+                                        def_id.krate,
+                                        |this| &mut this.global_metadata_hashes))
             }
 
             _ => {
@@ -89,32 +102,37 @@ impl<'a, 'tcx> HashContext<'a, 'tcx> {
         }
     }
 
-    fn metadata_hash(&mut self, def_id: DefId) -> u64 {
-        debug!("metadata_hash(def_id={:?})", def_id);
+    fn metadata_hash<K, C>(&mut self,
+                           key: K,
+                           cnum: CrateNum,
+                           cache: C)
+                           -> Fingerprint
+        where K: Hash + Eq + Debug,
+              C: Fn(&mut Self) -> &mut FxHashMap<K, Fingerprint>,
+    {
+        debug!("metadata_hash(key={:?})", key);
 
-        assert!(!def_id.is_local());
+        debug_assert!(cnum != LOCAL_CRATE);
         loop {
             // check whether we have a result cached for this def-id
-            if let Some(&hash) = self.item_metadata_hashes.get(&def_id) {
-                debug!("metadata_hash: def_id={:?} hash={:?}", def_id, hash);
+            if let Some(&hash) = cache(self).get(&key) {
                 return hash;
             }
 
             // check whether we did not find detailed metadata for this
             // krate; in that case, we just use the krate's overall hash
-            if let Some(&hash) = self.crate_hashes.get(&def_id.krate) {
-                debug!("metadata_hash: def_id={:?} crate_hash={:?}", def_id, hash);
-
+            if let Some(&svh) = self.crate_hashes.get(&cnum) {
                 // micro-"optimization": avoid a cache miss if we ask
                 // for metadata from this particular def-id again.
-                self.item_metadata_hashes.insert(def_id, hash.as_u64());
+                let fingerprint = svh_to_fingerprint(svh);
+                cache(self).insert(key, fingerprint);
 
-                return hash.as_u64();
+                return fingerprint;
             }
 
             // otherwise, load the data and repeat.
-            self.load_data(def_id.krate);
-            assert!(self.crate_hashes.contains_key(&def_id.krate));
+            self.load_data(cnum);
+            assert!(self.crate_hashes.contains_key(&cnum));
         }
     }
 
@@ -152,7 +170,7 @@ impl<'a, 'tcx> HashContext<'a, 'tcx> {
 
             let hashes_file_path = metadata_hash_import_path(&session_dir);
 
-            match file_format::read_file(&hashes_file_path)
+            match file_format::read_file(self.tcx.sess, &hashes_file_path)
             {
                 Ok(Some(data)) => {
                     match self.load_from_data(cnum, &data, svh) {
@@ -192,7 +210,7 @@ impl<'a, 'tcx> HashContext<'a, 'tcx> {
         }
 
         let serialized_hashes = SerializedMetadataHashes::decode(&mut decoder)?;
-        for serialized_hash in serialized_hashes.hashes {
+        for serialized_hash in serialized_hashes.entry_hashes {
             // the hashes are stored with just a def-index, which is
             // always relative to the old crate; convert that to use
             // our internal crate number
@@ -203,6 +221,27 @@ impl<'a, 'tcx> HashContext<'a, 'tcx> {
             debug!("load_from_data: def_id={:?} hash={}", def_id, serialized_hash.hash);
             assert!(old.is_none(), "already have hash for {:?}", def_id);
         }
+
+        for (dep_node, fingerprint) in serialized_hashes.global_hashes {
+            // Here we need to remap the CrateNum in the DepNode.
+            let def_id = DefId { krate: cnum, index: CRATE_DEF_INDEX };
+            let dep_node = match dep_node {
+                DepNode::GlobalMetaData(_, kind) => DepNode::GlobalMetaData(def_id, kind),
+                other => {
+                    bug!("unexpected DepNode variant: {:?}", other)
+                }
+            };
+
+            // record the hash for this dep-node
+            debug!("load_from_data: def_node={:?} hash={}", dep_node, fingerprint);
+            let old = self.global_metadata_hashes.insert(dep_node.clone(), fingerprint);
+            assert!(old.is_none(), "already have hash for {:?}", dep_node);
+        }
+
         Ok(())
     }
+}
+
+fn svh_to_fingerprint(svh: Svh) -> Fingerprint {
+    Fingerprint::from_smaller_hash(svh.as_u64())
 }

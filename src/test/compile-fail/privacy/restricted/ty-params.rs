@@ -8,19 +8,12 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-#![feature(pub_restricted)]
-
 macro_rules! m {
-    ($p: path) => (pub($p) struct Z;)
+    ($p: path) => (pub(in $p) struct Z;)
 }
 
 struct S<T>(T);
 m!{ S<u8> } //~ ERROR type or lifetime parameters in visibility path
-//~^ ERROR failed to resolve module path. Not a module `S`
-
-mod foo {
-    struct S(pub(foo<T>) ()); //~ ERROR type or lifetime parameters in visibility path
-    //~^ ERROR type name `T` is undefined or not in scope
-}
+//~^ ERROR expected module, found struct `S`
 
 fn main() {}

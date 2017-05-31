@@ -8,15 +8,15 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use rustc_data_structures::fnv::{FnvHashMap, FnvHashSet};
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
 use super::{DepGraphQuery, DepNode};
 
 pub struct DepGraphEdges<D: Clone + Debug + Eq + Hash> {
     nodes: Vec<DepNode<D>>,
-    indices: FnvHashMap<DepNode<D>, IdIndex>,
-    edges: FnvHashSet<(IdIndex, IdIndex)>,
+    indices: FxHashMap<DepNode<D>, IdIndex>,
+    edges: FxHashSet<(IdIndex, IdIndex)>,
     open_nodes: Vec<OpenNode>,
 }
 
@@ -46,8 +46,8 @@ impl<D: Clone + Debug + Eq + Hash> DepGraphEdges<D> {
     pub fn new() -> DepGraphEdges<D> {
         DepGraphEdges {
             nodes: vec![],
-            indices: FnvHashMap(),
-            edges: FnvHashSet(),
+            indices: FxHashMap(),
+            edges: FxHashSet(),
             open_nodes: Vec::new()
         }
     }
@@ -101,11 +101,15 @@ impl<D: Clone + Debug + Eq + Hash> DepGraphEdges<D> {
     }
 
     /// Indicates that the current task `C` reads `v` by adding an
-    /// edge from `v` to `C`. If there is no current task, panics. If
-    /// you want to suppress this edge, use `ignore`.
+    /// edge from `v` to `C`. If there is no current task, has no
+    /// effect. Note that *reading* from tracked state is harmless if
+    /// you are not in a task; what is bad is *writing* to tracked
+    /// state (and leaking data that you read into a tracked task).
     pub fn read(&mut self, v: DepNode<D>) {
-        let source = self.make_node(v);
-        self.add_edge_from_current_node(|current| (source, current))
+        if self.current_node().is_some() {
+            let source = self.make_node(v);
+            self.add_edge_from_current_node(|current| (source, current))
+        }
     }
 
     /// Indicates that the current task `C` writes `v` by adding an

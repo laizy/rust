@@ -33,7 +33,7 @@ impl<'a> Encoder<'a> {
 macro_rules! write_uleb128 {
     ($enc:expr, $value:expr) => {{
         let pos = $enc.cursor.position() as usize;
-        let bytes_written = write_unsigned_leb128($enc.cursor.get_mut(), pos, $value as u64);
+        let bytes_written = write_unsigned_leb128($enc.cursor.get_mut(), pos, $value as u128);
         $enc.cursor.set_position((pos + bytes_written) as u64);
         Ok(())
     }}
@@ -42,7 +42,7 @@ macro_rules! write_uleb128 {
 macro_rules! write_sleb128 {
     ($enc:expr, $value:expr) => {{
         let pos = $enc.cursor.position() as usize;
-        let bytes_written = write_signed_leb128($enc.cursor.get_mut(), pos, $value as i64);
+        let bytes_written = write_signed_leb128($enc.cursor.get_mut(), pos, $value as i128);
         $enc.cursor.set_position((pos + bytes_written) as u64);
         Ok(())
     }}
@@ -56,6 +56,10 @@ impl<'a> serialize::Encoder for Encoder<'a> {
     }
 
     fn emit_usize(&mut self, v: usize) -> EncodeResult {
+        write_uleb128!(self, v)
+    }
+
+    fn emit_u128(&mut self, v: u128) -> EncodeResult {
         write_uleb128!(self, v)
     }
 
@@ -77,6 +81,10 @@ impl<'a> serialize::Encoder for Encoder<'a> {
     }
 
     fn emit_isize(&mut self, v: isize) -> EncodeResult {
+        write_sleb128!(self, v)
+    }
+
+    fn emit_i128(&mut self, v: i128) -> EncodeResult {
         write_sleb128!(self, v)
     }
 
@@ -179,74 +187,100 @@ macro_rules! read_sleb128 {
 impl<'a> serialize::Decoder for Decoder<'a> {
     type Error = String;
 
+    #[inline]
     fn read_nil(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
 
+    #[inline]
+    fn read_u128(&mut self) -> Result<u128, Self::Error> {
+        read_uleb128!(self, u128)
+    }
+
+    #[inline]
     fn read_u64(&mut self) -> Result<u64, Self::Error> {
         read_uleb128!(self, u64)
     }
 
+    #[inline]
     fn read_u32(&mut self) -> Result<u32, Self::Error> {
         read_uleb128!(self, u32)
     }
 
+    #[inline]
     fn read_u16(&mut self) -> Result<u16, Self::Error> {
         read_uleb128!(self, u16)
     }
 
+    #[inline]
     fn read_u8(&mut self) -> Result<u8, Self::Error> {
         let value = self.data[self.position];
         self.position += 1;
         Ok(value)
     }
 
+    #[inline]
     fn read_usize(&mut self) -> Result<usize, Self::Error> {
         read_uleb128!(self, usize)
     }
 
+    #[inline]
+    fn read_i128(&mut self) -> Result<i128, Self::Error> {
+        read_sleb128!(self, i128)
+    }
+
+    #[inline]
     fn read_i64(&mut self) -> Result<i64, Self::Error> {
         read_sleb128!(self, i64)
     }
 
+    #[inline]
     fn read_i32(&mut self) -> Result<i32, Self::Error> {
         read_sleb128!(self, i32)
     }
 
+    #[inline]
     fn read_i16(&mut self) -> Result<i16, Self::Error> {
         read_sleb128!(self, i16)
     }
 
+    #[inline]
     fn read_i8(&mut self) -> Result<i8, Self::Error> {
         let as_u8 = self.data[self.position];
         self.position += 1;
         unsafe { Ok(::std::mem::transmute(as_u8)) }
     }
 
+    #[inline]
     fn read_isize(&mut self) -> Result<isize, Self::Error> {
         read_sleb128!(self, isize)
     }
 
+    #[inline]
     fn read_bool(&mut self) -> Result<bool, Self::Error> {
         let value = self.read_u8()?;
         Ok(value != 0)
     }
 
+    #[inline]
     fn read_f64(&mut self) -> Result<f64, Self::Error> {
         let bits = self.read_u64()?;
         Ok(unsafe { ::std::mem::transmute(bits) })
     }
 
+    #[inline]
     fn read_f32(&mut self) -> Result<f32, Self::Error> {
         let bits = self.read_u32()?;
         Ok(unsafe { ::std::mem::transmute(bits) })
     }
 
+    #[inline]
     fn read_char(&mut self) -> Result<char, Self::Error> {
         let bits = self.read_u32()?;
         Ok(::std::char::from_u32(bits).unwrap())
     }
 
+    #[inline]
     fn read_str(&mut self) -> Result<Cow<str>, Self::Error> {
         let len = self.read_usize()?;
         let s = ::std::str::from_utf8(&self.data[self.position..self.position + len]).unwrap();

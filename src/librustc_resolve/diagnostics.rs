@@ -15,6 +15,33 @@
 // use `gq` to wrap paragraphs. Use `:set tw=0` to disable.
 register_long_diagnostics! {
 
+E0128: r##"
+Type parameter defaults can only use parameters that occur before them.
+Erroneous code example:
+
+```compile_fail,E0128
+struct Foo<T=U, U=()> {
+    field1: T,
+    filed2: U,
+}
+// error: type parameters with a default cannot use forward declared
+// identifiers
+```
+
+Since type parameters are evaluated in-order, you may be able to fix this issue
+by doing:
+
+```
+struct Foo<U=(), T=U> {
+    field1: T,
+    filed2: U,
+}
+```
+
+Please also verify that this wasn't because of a name-clash and rename the type
+parameter if so.
+"##,
+
 E0154: r##"
 ## Note: this error code is no longer emitted by the compiler.
 
@@ -59,7 +86,7 @@ items under a new local name.
 
 An example of this error:
 
-```compile_fail
+```ignore
 use foo::baz;
 use bar::*; // error, do `use foo::baz as quux` instead on the previous line
 
@@ -811,6 +838,32 @@ trait Foo {
 
 fn foo<T>(x: T) {} // ok!
 ```
+
+Another case that causes this error is when a type is imported into a parent
+module. To fix this, you can follow the suggestion and use File directly or
+`use super::File;` which will import the types from the parent namespace. An
+example that causes this error is below:
+
+```compile_fail,E0412
+use std::fs::File;
+
+mod foo {
+    fn some_function(f: File) {}
+}
+```
+
+```
+use std::fs::File;
+
+mod foo {
+    // either
+    use super::File;
+    // or
+    // use std::fs::File;
+    fn foo(f: File) {}
+}
+# fn main() {} // don't insert it for us; that'll break imports
+```
 "##,
 
 E0415: r##"
@@ -862,10 +915,9 @@ match (A, B, C) {
 
 E0422: r##"
 You are trying to use an identifier that is either undefined or not a struct.
-
 Erroneous code example:
 
-``` compile_fail,E0422
+```compile_fail,E0422
 fn main () {
     let x = Foo { x: 1, y: 2 };
 }
@@ -874,7 +926,7 @@ fn main () {
 In this case, `Foo` is undefined, so it inherently isn't anything, and
 definitely not a struct.
 
-```compile_fail,E0422
+```compile_fail
 fn main () {
     let foo = 1;
     let x = foo { x: 1, y: 2 };
@@ -1196,27 +1248,26 @@ fn foo() {
 "##,
 
 E0435: r##"
-A non-constant value was used to initialise a constant.
+A non-constant value was used in a constant expression.
 
 Erroneous code example:
 
 ```compile_fail,E0435
-let foo = 42u32;
-const FOO : u32 = foo; // error: attempt to use a non-constant value in a
-                       //        constant
+let foo = 42;
+let a: [u8; foo]; // error: attempt to use a non-constant value in a constant
 ```
 
 To fix this error, please replace the value with a constant. Example:
 
 ```
-const FOO : u32 = 42u32; // ok!
+let a: [u8; 42]; // ok!
 ```
 
 Or:
 
 ```
-const OTHER_FOO : u32 = 42u32;
-const FOO : u32 = OTHER_FOO; // ok!
+const FOO: usize = 42;
+let a: [u8; FOO]; // ok!
 ```
 "##,
 
@@ -1272,6 +1323,185 @@ impl Foo for i32 {}
 ```
 "##,
 
+E0466: r##"
+Macro import declarations were malformed.
+
+Erroneous code examples:
+
+```compile_fail,E0466
+#[macro_use(a_macro(another_macro))] // error: invalid import declaration
+extern crate core as some_crate;
+
+#[macro_use(i_want = "some_macros")] // error: invalid import declaration
+extern crate core as another_crate;
+```
+
+This is a syntax error at the level of attribute declarations. The proper
+syntax for macro imports is the following:
+
+```ignore
+// In some_crate:
+#[macro_export]
+macro_rules! get_tacos {
+    ...
+}
+
+#[macro_export]
+macro_rules! get_pimientos {
+    ...
+}
+
+// In your crate:
+#[macro_use(get_tacos, get_pimientos)] // It imports `get_tacos` and
+extern crate some_crate;               // `get_pimientos` macros from some_crate
+```
+
+If you would like to import all exported macros, write `macro_use` with no
+arguments.
+"##,
+
+E0467: r##"
+Macro reexport declarations were empty or malformed.
+
+Erroneous code examples:
+
+```compile_fail,E0467
+#[macro_reexport]                    // error: no macros listed for export
+extern crate core as macros_for_good;
+
+#[macro_reexport(fun_macro = "foo")] // error: not a macro identifier
+extern crate core as other_macros_for_good;
+```
+
+This is a syntax error at the level of attribute declarations.
+
+Currently, `macro_reexport` requires at least one macro name to be listed.
+Unlike `macro_use`, listing no names does not reexport all macros from the
+given crate.
+
+Decide which macros you would like to export and list them properly.
+
+These are proper reexport declarations:
+
+```ignore
+#[macro_reexport(some_macro, another_macro)]
+extern crate macros_for_good;
+```
+"##,
+
+E0468: r##"
+A non-root module attempts to import macros from another crate.
+
+Example of erroneous code:
+
+```compile_fail,E0468
+mod foo {
+    #[macro_use(helpful_macro)] // error: must be at crate root to import
+    extern crate core;          //        macros from another crate
+    helpful_macro!(...);
+}
+```
+
+Only `extern crate` imports at the crate root level are allowed to import
+macros.
+
+Either move the macro import to crate root or do without the foreign macros.
+This will work:
+
+```ignore
+#[macro_use(helpful_macro)]
+extern crate some_crate;
+
+mod foo {
+    helpful_macro!(...)
+}
+```
+"##,
+
+E0469: r##"
+A macro listed for import was not found.
+
+Erroneous code example:
+
+```compile_fail,E0469
+#[macro_use(drink, be_merry)] // error: imported macro not found
+extern crate collections;
+
+fn main() {
+    // ...
+}
+```
+
+Either the listed macro is not contained in the imported crate, or it is not
+exported from the given crate.
+
+This could be caused by a typo. Did you misspell the macro's name?
+
+Double-check the names of the macros listed for import, and that the crate
+in question exports them.
+
+A working version would be:
+
+```ignore
+// In some_crate crate:
+#[macro_export]
+macro_rules! eat {
+    ...
+}
+
+#[macro_export]
+macro_rules! drink {
+    ...
+}
+
+// In your crate:
+#[macro_use(eat, drink)]
+extern crate some_crate; //ok!
+```
+"##,
+
+E0470: r##"
+A macro listed for reexport was not found.
+
+Erroneous code example:
+
+```compile_fail,E0470
+#[macro_reexport(drink, be_merry)]
+extern crate collections;
+
+fn main() {
+    // ...
+}
+```
+
+Either the listed macro is not contained in the imported crate, or it is not
+exported from the given crate.
+
+This could be caused by a typo. Did you misspell the macro's name?
+
+Double-check the names of the macros listed for reexport, and that the crate
+in question exports them.
+
+A working version:
+
+```ignore
+// In some_crate crate:
+#[macro_export]
+macro_rules! eat {
+    ...
+}
+
+#[macro_export]
+macro_rules! drink {
+    ...
+}
+
+// In your_crate:
+#[macro_reexport(eat, drink)]
+extern crate some_crate;
+```
+"##,
+
 E0530: r##"
 A binding shadowed something it shouldn't.
 
@@ -1307,6 +1537,47 @@ match r {
 ```
 "##,
 
+E0532: r##"
+Pattern arm did not match expected kind.
+
+Erroneous code example:
+
+```compile_fail,E0532
+enum State {
+    Succeeded,
+    Failed(String),
+}
+
+fn print_on_failure(state: &State) {
+    match *state {
+        // error: expected unit struct/variant or constant, found tuple
+        //        variant `State::Failed`
+        State::Failed => println!("Failed"),
+        _ => ()
+    }
+}
+```
+
+To fix this error, ensure the match arm kind is the same as the expression
+matched.
+
+Fixed example:
+
+```
+enum State {
+    Succeeded,
+    Failed(String),
+}
+
+fn print_on_failure(state: &State) {
+    match *state {
+        State::Failed(ref msg) => println!("Failed with {}", msg),
+        _ => ()
+    }
+}
+```
+"##,
+
 }
 
 register_diagnostics! {
@@ -1314,7 +1585,7 @@ register_diagnostics! {
 //  E0157, unused error code
 //  E0257,
 //  E0258,
-    E0402, // cannot use an outer type parameter in this context
+//  E0402, // cannot use an outer type parameter in this context
 //  E0406, merged into 420
 //  E0410, merged into 408
 //  E0413, merged into 530
@@ -1325,6 +1596,11 @@ register_diagnostics! {
 //  E0420, merged into 532
 //  E0421, merged into 531
     E0531, // unresolved pattern path kind `name`
-    E0532, // expected pattern path kind, found another pattern path kind
 //  E0427, merged into 530
+    E0573,
+    E0574,
+    E0575,
+    E0576,
+    E0577,
+    E0578,
 }

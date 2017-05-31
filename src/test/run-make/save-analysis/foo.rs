@@ -10,8 +10,8 @@
 
 #![ crate_name = "test" ]
 #![feature(box_syntax)]
-#![feature(dotdot_in_tuple_patterns)]
 #![feature(rustc_private)]
+#![feature(associated_type_defaults)]
 
 extern crate graphviz;
 // A simple rust project
@@ -56,6 +56,12 @@ fn test_alias<I: Iterator>(i: Option<<I as Iterator>::Item>) {
 
     let x = (3isize, 4usize);
     let y = x.1;
+}
+
+// Issue #37700
+const LUT_BITS: usize = 3;
+pub struct HuffmanTable {
+    ac_lut: Option<[(i16, u8); 1 << LUT_BITS]>,
 }
 
 struct TupStruct(isize, isize, Box<str>);
@@ -435,4 +441,20 @@ fn test_format_args() {
     print!("Hello {0}", name);
     print!("{0} + {} = {}", x, y);
     print!("x is {}, y is {1}, name is {n}", x, y, n = name);
+}
+
+struct FrameBuffer;
+
+struct SilenceGenerator;
+
+impl Iterator for SilenceGenerator {
+    type Item = FrameBuffer;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        panic!();
+    }
+}
+
+trait Foo {
+    type Bar = FrameBuffer;
 }

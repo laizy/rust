@@ -20,6 +20,7 @@ use std::str;
 use libc;
 use llvm::archive_ro::{ArchiveRO, Child};
 use llvm::{self, ArchiveKind};
+use metadata::METADATA_FILENAME;
 use rustc::session::Session;
 
 pub struct ArchiveConfig<'a> {
@@ -65,10 +66,10 @@ pub fn find_library(name: &str, search_paths: &[PathBuf], sess: &Session)
 
     for path in search_paths {
         debug!("looking for {} inside {:?}", name, path);
-        let test = path.join(&oslibname[..]);
+        let test = path.join(&oslibname);
         if test.exists() { return test }
         if oslibname != unixlibname {
-            let test = path.join(&unixlibname[..]);
+            let test = path.join(&unixlibname);
             if test.exists() { return test }
         }
     }
@@ -145,8 +146,11 @@ impl<'a> ArchiveBuilder<'a> {
     ///
     /// This ignores adding the bytecode from the rlib, and if LTO is enabled
     /// then the object file also isn't added.
-    pub fn add_rlib(&mut self, rlib: &Path, name: &str, lto: bool)
-                    -> io::Result<()> {
+    pub fn add_rlib(&mut self,
+                    rlib: &Path,
+                    name: &str,
+                    lto: bool,
+                    skip_objects: bool) -> io::Result<()> {
         // Ignoring obj file starting with the crate name
         // as simple comparison is not enough - there
         // might be also an extra name suffix
@@ -155,13 +159,25 @@ impl<'a> ArchiveBuilder<'a> {
         // Ignoring all bytecode files, no matter of
         // name
         let bc_ext = ".bytecode.deflate";
-        let metadata_filename =
-            self.config.sess.cstore.metadata_filename().to_owned();
 
         self.add_archive(rlib, move |fname: &str| {
-            let skip_obj = lto && fname.starts_with(&obj_start)
-                && fname.ends_with(".o");
-            skip_obj || fname.ends_with(bc_ext) || fname == metadata_filename
+            if fname.ends_with(bc_ext) || fname == METADATA_FILENAME {
+                return true
+            }
+
+            // Don't include Rust objects if LTO is enabled
+            if lto && fname.starts_with(&obj_start) && fname.ends_with(".o") {
+                return true
+            }
+
+            // Otherwise if this is *not* a rust object and we're skipping
+            // objects then skip this file
+            if skip_objects && (!fname.starts_with(&obj_start) || !fname.ends_with(".o")) {
+                return true
+            }
+
+            // ok, don't skip this
+            return false
         })
     }
 
@@ -214,7 +230,7 @@ impl<'a> ArchiveBuilder<'a> {
     }
 
     fn llvm_archive_kind(&self) -> Result<ArchiveKind, &str> {
-        let kind = &self.config.sess.target.target.options.archive_format[..];
+        let kind = &*self.config.sess.target.target.options.archive_format;
         kind.parse().map_err(|_| kind)
     }
 

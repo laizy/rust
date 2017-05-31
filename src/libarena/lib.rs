@@ -19,21 +19,21 @@
 //! objects of a single type.
 
 #![crate_name = "arena"]
-#![unstable(feature = "rustc_private", issue = "27812")]
+#![cfg_attr(stage0, unstable(feature = "rustc_private", issue = "27812"))]
 #![crate_type = "rlib"]
 #![crate_type = "dylib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/",
        test(no_crate_inject, attr(deny(warnings))))]
-#![cfg_attr(not(stage0), deny(warnings))]
+#![deny(warnings)]
 
 #![feature(alloc)]
 #![feature(core_intrinsics)]
-#![feature(heap_api)]
-#![feature(heap_api)]
-#![feature(staged_api)]
-#![feature(dropck_parametricity)]
+#![feature(dropck_eyepatch)]
+#![feature(generic_param_attrs)]
+#![feature(needs_drop)]
+#![cfg_attr(stage0, feature(staged_api))]
 #![cfg_attr(test, feature(test))]
 
 #![allow(deprecated)]
@@ -46,8 +46,8 @@ use std::intrinsics;
 use std::marker::{PhantomData, Send};
 use std::mem;
 use std::ptr;
+use std::slice;
 
-use alloc::heap;
 use alloc::raw_vec::RawVec;
 
 /// An arena that can hold objects of only one type.
@@ -83,7 +83,7 @@ impl<T> TypedArenaChunk<T> {
     unsafe fn destroy(&mut self, len: usize) {
         // The branch on needs_drop() is an -O1 performance optimization.
         // Without the branch, dropping TypedArena<u8> takes linear time.
-        if intrinsics::needs_drop::<T>() {
+        if mem::needs_drop::<T>() {
             let mut start = self.start();
             // Destroy all allocated objects.
             for _ in 0..len {
@@ -133,13 +133,13 @@ impl<T> TypedArena<T> {
     #[inline]
     pub fn alloc(&self, object: T) -> &mut T {
         if self.ptr == self.end {
-            self.grow()
+            self.grow(1)
         }
 
         unsafe {
             if mem::size_of::<T>() == 0 {
                 self.ptr.set(intrinsics::arith_offset(self.ptr.get() as *mut u8, 1) as *mut T);
-                let ptr = heap::EMPTY as *mut T;
+                let ptr = mem::align_of::<T>() as *mut T;
                 // Don't drop the object. This `write` is equivalent to `forget`.
                 ptr::write(ptr, object);
                 &mut *ptr
@@ -154,24 +154,58 @@ impl<T> TypedArena<T> {
         }
     }
 
+    /// Allocates a slice of objects that are copy into the `TypedArena`, returning a mutable
+    /// reference to it. Will panic if passed a zero-sized types.
+    ///
+    /// Panics:
+    ///  - Zero-sized types
+    ///  - Zero-length slices
+    #[inline]
+    pub fn alloc_slice(&self, slice: &[T]) -> &mut [T]
+        where T: Copy {
+        assert!(mem::size_of::<T>() != 0);
+        assert!(slice.len() != 0);
+
+        let available_capacity_bytes = self.end.get() as usize - self.ptr.get() as usize;
+        let at_least_bytes = slice.len() * mem::size_of::<T>();
+        if available_capacity_bytes < at_least_bytes {
+            self.grow(slice.len());
+        }
+
+        unsafe {
+            let start_ptr = self.ptr.get();
+            let arena_slice = slice::from_raw_parts_mut(start_ptr, slice.len());
+            self.ptr.set(start_ptr.offset(arena_slice.len() as isize));
+            arena_slice.copy_from_slice(slice);
+            arena_slice
+        }
+    }
+
     /// Grows the arena.
     #[inline(never)]
     #[cold]
-    fn grow(&self) {
+    fn grow(&self, n: usize) {
         unsafe {
             let mut chunks = self.chunks.borrow_mut();
-            let (chunk, new_capacity);
+            let (chunk, mut new_capacity);
             if let Some(last_chunk) = chunks.last_mut() {
-                if last_chunk.storage.double_in_place() {
+                let used_bytes = self.ptr.get() as usize - last_chunk.start() as usize;
+                let currently_used_cap = used_bytes / mem::size_of::<T>();
+                if last_chunk.storage.reserve_in_place(currently_used_cap, n) {
                     self.end.set(last_chunk.end());
                     return;
                 } else {
-                    let prev_capacity = last_chunk.storage.cap();
-                    new_capacity = prev_capacity.checked_mul(2).unwrap();
+                    new_capacity = last_chunk.storage.cap();
+                    loop {
+                        new_capacity = new_capacity.checked_mul(2).unwrap();
+                        if new_capacity >= currently_used_cap + n {
+                            break;
+                        }
+                    }
                 }
             } else {
                 let elem_size = cmp::max(1, mem::size_of::<T>());
-                new_capacity = cmp::max(1, PAGE / elem_size);
+                new_capacity = cmp::max(n, PAGE / elem_size);
             }
             chunk = TypedArenaChunk::<T>::new(new_capacity);
             self.ptr.set(chunk.start());
@@ -223,8 +257,7 @@ impl<T> TypedArena<T> {
     }
 }
 
-impl<T> Drop for TypedArena<T> {
-    #[unsafe_destructor_blind_to_params]
+unsafe impl<#[may_dangle] T> Drop for TypedArena<T> {
     fn drop(&mut self) {
         unsafe {
             // Determine how much was filled.
@@ -244,6 +277,131 @@ impl<T> Drop for TypedArena<T> {
 }
 
 unsafe impl<T: Send> Send for TypedArena<T> {}
+
+pub struct DroplessArena {
+    /// A pointer to the next object to be allocated.
+    ptr: Cell<*mut u8>,
+
+    /// A pointer to the end of the allocated area. When this pointer is
+    /// reached, a new chunk is allocated.
+    end: Cell<*mut u8>,
+
+    /// A vector of arena chunks.
+    chunks: RefCell<Vec<TypedArenaChunk<u8>>>,
+}
+
+impl DroplessArena {
+    pub fn new() -> DroplessArena {
+        DroplessArena {
+            ptr: Cell::new(0 as *mut u8),
+            end: Cell::new(0 as *mut u8),
+            chunks: RefCell::new(vec![]),
+        }
+    }
+
+    pub fn in_arena<T: ?Sized>(&self, ptr: *const T) -> bool {
+        let ptr = ptr as *const u8 as *mut u8;
+        for chunk in &*self.chunks.borrow() {
+            if chunk.start() <= ptr && ptr < chunk.end() {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn align_for<T>(&self) {
+        let align = mem::align_of::<T>();
+        let final_address = ((self.ptr.get() as usize) + align - 1) & !(align - 1);
+        self.ptr.set(final_address as *mut u8);
+        assert!(self.ptr <= self.end);
+    }
+
+    #[inline(never)]
+    #[cold]
+    fn grow<T>(&self, n: usize) {
+        let needed_bytes = n * mem::size_of::<T>();
+        unsafe {
+            let mut chunks = self.chunks.borrow_mut();
+            let (chunk, mut new_capacity);
+            if let Some(last_chunk) = chunks.last_mut() {
+                let used_bytes = self.ptr.get() as usize - last_chunk.start() as usize;
+                if last_chunk.storage.reserve_in_place(used_bytes, needed_bytes) {
+                    self.end.set(last_chunk.end());
+                    return;
+                } else {
+                    new_capacity = last_chunk.storage.cap();
+                    loop {
+                        new_capacity = new_capacity.checked_mul(2).unwrap();
+                        if new_capacity >= used_bytes + needed_bytes {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                new_capacity = cmp::max(needed_bytes, PAGE);
+            }
+            chunk = TypedArenaChunk::<u8>::new(new_capacity);
+            self.ptr.set(chunk.start());
+            self.end.set(chunk.end());
+            chunks.push(chunk);
+        }
+    }
+
+    #[inline]
+    pub fn alloc<T>(&self, object: T) -> &mut T {
+        unsafe {
+            assert!(!mem::needs_drop::<T>());
+            assert!(mem::size_of::<T>() != 0);
+
+            self.align_for::<T>();
+            let future_end = intrinsics::arith_offset(self.ptr.get(), mem::size_of::<T>() as isize);
+            if (future_end as *mut u8) >= self.end.get() {
+                self.grow::<T>(1)
+            }
+
+            let ptr = self.ptr.get();
+            // Set the pointer past ourselves
+            self.ptr.set(intrinsics::arith_offset(
+                    self.ptr.get(), mem::size_of::<T>() as isize
+            ) as *mut u8);
+            // Write into uninitialized memory.
+            ptr::write(ptr as *mut T, object);
+            &mut *(ptr as *mut T)
+        }
+    }
+
+    /// Allocates a slice of objects that are copied into the `DroplessArena`, returning a mutable
+    /// reference to it. Will panic if passed a zero-sized type.
+    ///
+    /// Panics:
+    ///  - Zero-sized types
+    ///  - Zero-length slices
+    #[inline]
+    pub fn alloc_slice<T>(&self, slice: &[T]) -> &mut [T]
+        where T: Copy {
+        assert!(!mem::needs_drop::<T>());
+        assert!(mem::size_of::<T>() != 0);
+        assert!(slice.len() != 0);
+        self.align_for::<T>();
+
+        let future_end = unsafe {
+            intrinsics::arith_offset(self.ptr.get(), (slice.len() * mem::size_of::<T>()) as isize)
+        };
+        if (future_end as *mut u8) >= self.end.get() {
+            self.grow::<T>(slice.len());
+        }
+
+        unsafe {
+            let arena_slice = slice::from_raw_parts_mut(self.ptr.get() as *mut T, slice.len());
+            self.ptr.set(intrinsics::arith_offset(
+                    self.ptr.get(), (slice.len() * mem::size_of::<T>()) as isize
+            ) as *mut u8);
+            arena_slice.copy_from_slice(slice);
+            arena_slice
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -302,9 +460,8 @@ mod tests {
 
         let arena = Wrap(TypedArena::new());
 
-        let result = arena.alloc_outer(|| {
-            Outer { inner: arena.alloc_inner(|| Inner { value: 10 }) }
-        });
+        let result =
+            arena.alloc_outer(|| Outer { inner: arena.alloc_inner(|| Inner { value: 10 }) });
 
         assert_eq!(result.inner.value, 10);
     }

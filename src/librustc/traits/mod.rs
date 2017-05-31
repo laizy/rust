@@ -15,11 +15,14 @@ pub use self::FulfillmentErrorCode::*;
 pub use self::Vtable::*;
 pub use self::ObligationCauseCode::*;
 
+use hir;
 use hir::def_id::DefId;
+use middle::region::RegionMaps;
 use middle::free_region::FreeRegionMap;
 use ty::subst::Substs;
-use ty::{self, Ty, TyCtxt, TypeFoldable};
-use infer::InferCtxt;
+use ty::{self, Ty, TyCtxt, TypeFoldable, ToPredicate};
+use ty::error::{ExpectedFound, TypeError};
+use infer::{InferCtxt};
 
 use std::rc::Rc;
 use syntax::ast;
@@ -30,17 +33,14 @@ pub use self::coherence::orphan_check;
 pub use self::coherence::overlapping_impls;
 pub use self::coherence::OrphanCheckErr;
 pub use self::fulfill::{FulfillmentContext, GlobalFulfilledPredicates, RegionObligation};
-pub use self::fulfill::DeferredObligation;
 pub use self::project::MismatchedProjectionTypes;
 pub use self::project::{normalize, normalize_projection_type, Normalized};
 pub use self::project::{ProjectionCache, ProjectionCacheSnapshot, Reveal};
 pub use self::object_safety::ObjectSafetyViolation;
 pub use self::object_safety::MethodViolationCode;
 pub use self::select::{EvaluationCache, SelectionContext, SelectionCache};
-pub use self::select::{MethodMatchResult, MethodMatched, MethodAmbiguous, MethodDidNotMatch};
-pub use self::select::{MethodMatchedData}; // intentionally don't export variants
 pub use self::specialize::{OverlapError, specialization_graph, specializes, translate_substs};
-pub use self::specialize::{SpecializesCache, find_method};
+pub use self::specialize::{SpecializesCache, find_associated_item};
 pub use self::util::elaborate_predicates;
 pub use self::util::supertraits;
 pub use self::util::Supertraits;
@@ -56,6 +56,7 @@ mod object_safety;
 mod select;
 mod specialize;
 mod structural_impls;
+pub mod trans;
 mod util;
 
 /// An `Obligation` represents some trait reference (e.g. `int:Eq`) for
@@ -111,6 +112,9 @@ pub enum ObligationCauseCode<'tcx> {
     /// A type like `&'a T` is WF only if `T: 'a`.
     ReferenceOutlivesReferent(Ty<'tcx>),
 
+    /// A type like `Box<Foo<'a> + 'b>` is WF only if `'b: 'a`.
+    ObjectTypeBound(Ty<'tcx>, ty::Region<'tcx>),
+
     /// Obligation incurred due to an object cast.
     ObjectCastObligation(/* Object type */ Ty<'tcx>),
 
@@ -120,10 +124,6 @@ pub enum ObligationCauseCode<'tcx> {
     VariableType(ast::NodeId), // Type of each variable must be Sized
     ReturnType,                // Return type must be Sized
     RepeatVec,                 // [T,..n] --> T must be Copy
-
-    // Captures of variable the given id by a closure (span is the
-    // span of the closure)
-    ClosureCapture(ast::NodeId, Span, ty::BuiltinBound),
 
     // Types of fields (other than the last) in a struct must be sized.
     FieldSized,
@@ -138,7 +138,45 @@ pub enum ObligationCauseCode<'tcx> {
 
     ImplDerivedObligation(DerivedObligationCause<'tcx>),
 
-    CompareImplMethodObligation,
+    // error derived when matching traits/impls; see ObligationCause for more details
+    CompareImplMethodObligation {
+        item_name: ast::Name,
+        impl_item_def_id: DefId,
+        trait_item_def_id: DefId,
+        lint_id: Option<ast::NodeId>,
+    },
+
+    // Checking that this expression can be assigned where it needs to be
+    // FIXME(eddyb) #11161 is the original Expr required?
+    ExprAssignable,
+
+    // Computing common supertype in the arms of a match expression
+    MatchExpressionArm { arm_span: Span,
+                         source: hir::MatchSource },
+
+    // Computing common supertype in an if expression
+    IfExpression,
+
+    // Computing common supertype of an if expression with no else counter-part
+    IfExpressionWithNoElse,
+
+    // `where a == b`
+    EquatePredicate,
+
+    // `main` has wrong type
+    MainFunctionType,
+
+    // `start` has wrong type
+    StartFunctionType,
+
+    // intrinsic has wrong type
+    IntrinsicType,
+
+    // method receiver
+    MethodReceiver,
+
+    // `return` with no expression
+    ReturnNoExpression,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,6 +215,8 @@ pub struct FulfillmentError<'tcx> {
 pub enum FulfillmentErrorCode<'tcx> {
     CodeSelectionError(SelectionError<'tcx>),
     CodeProjectionError(MismatchedProjectionTypes<'tcx>),
+    CodeSubtypeError(ExpectedFound<Ty<'tcx>>,
+                     TypeError<'tcx>), // always comes from a SubtypePredicate
     CodeAmbiguity,
 }
 
@@ -330,27 +370,30 @@ pub fn predicates_for_generics<'tcx>(cause: ObligationCause<'tcx>,
 /// `bound` or is not known to meet bound (note that this is
 /// conservative towards *no impl*, which is the opposite of the
 /// `evaluate` methods).
-pub fn type_known_to_meet_builtin_bound<'a, 'gcx, 'tcx>(infcx: &InferCtxt<'a, 'gcx, 'tcx>,
-                                                        ty: Ty<'tcx>,
-                                                        bound: ty::BuiltinBound,
-                                                        span: Span)
-                                                        -> bool
+pub fn type_known_to_meet_bound<'a, 'gcx, 'tcx>(infcx: &InferCtxt<'a, 'gcx, 'tcx>,
+                                                ty: Ty<'tcx>,
+                                                def_id: DefId,
+                                                span: Span)
+-> bool
 {
-    debug!("type_known_to_meet_builtin_bound(ty={:?}, bound={:?})",
+    debug!("type_known_to_meet_bound(ty={:?}, bound={:?})",
            ty,
-           bound);
+           infcx.tcx.item_path_str(def_id));
 
-    let cause = ObligationCause::misc(span, ast::DUMMY_NODE_ID);
-    let obligation =
-        infcx.tcx.predicate_for_builtin_bound(cause, bound, 0, ty);
-    let obligation = match obligation {
-        Ok(o) => o,
-        Err(..) => return false
+    let trait_ref = ty::TraitRef {
+        def_id: def_id,
+        substs: infcx.tcx.mk_substs_trait(ty, &[]),
     };
+    let obligation = Obligation {
+        cause: ObligationCause::misc(span, ast::DUMMY_NODE_ID),
+        recursion_depth: 0,
+        predicate: trait_ref.to_predicate(),
+    };
+
     let result = SelectionContext::new(infcx)
         .evaluate_obligation_conservatively(&obligation);
-    debug!("type_known_to_meet_builtin_bound: ty={:?} bound={:?} => {:?}",
-           ty, bound, result);
+    debug!("type_known_to_meet_ty={:?} bound={} => {:?}",
+           ty, infcx.tcx.item_path_str(def_id), result);
 
     if result && (ty.has_infer_types() || ty.has_closure_types()) {
         // Because of inference "guessing", selection can sometimes claim
@@ -365,22 +408,22 @@ pub fn type_known_to_meet_builtin_bound<'a, 'gcx, 'tcx>(infcx: &InferCtxt<'a, 'g
         // anyhow).
         let cause = ObligationCause::misc(span, ast::DUMMY_NODE_ID);
 
-        fulfill_cx.register_builtin_bound(infcx, ty, bound, cause);
+        fulfill_cx.register_bound(infcx, ty, def_id, cause);
 
         // Note: we only assume something is `Copy` if we can
         // *definitively* show that it implements `Copy`. Otherwise,
         // assume it is move; linear is always ok.
         match fulfill_cx.select_all_or_error(infcx) {
             Ok(()) => {
-                debug!("type_known_to_meet_builtin_bound: ty={:?} bound={:?} success",
+                debug!("type_known_to_meet_bound: ty={:?} bound={} success",
                        ty,
-                       bound);
+                       infcx.tcx.item_path_str(def_id));
                 true
             }
             Err(e) => {
-                debug!("type_known_to_meet_builtin_bound: ty={:?} bound={:?} errors={:?}",
+                debug!("type_known_to_meet_bound: ty={:?} bound={} errors={:?}",
                        ty,
-                       bound,
+                       infcx.tcx.item_path_str(def_id),
                        e);
                 false
             }
@@ -393,9 +436,10 @@ pub fn type_known_to_meet_builtin_bound<'a, 'gcx, 'tcx>(infcx: &InferCtxt<'a, 'g
 // FIXME: this is gonna need to be removed ...
 /// Normalizes the parameter environment, reporting errors if they occur.
 pub fn normalize_param_env_or_error<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
-    unnormalized_env: ty::ParameterEnvironment<'tcx>,
-    cause: ObligationCause<'tcx>)
-    -> ty::ParameterEnvironment<'tcx>
+                                              region_context: DefId,
+                                              unnormalized_env: ty::ParamEnv<'tcx>,
+                                              cause: ObligationCause<'tcx>)
+                                              -> ty::ParamEnv<'tcx>
 {
     // I'm not wild about reporting errors here; I'd prefer to
     // have the errors get reported at a defined place (e.g.,
@@ -413,13 +457,12 @@ pub fn normalize_param_env_or_error<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     // can be sure that no errors should occur.
 
     let span = cause.span;
-    let body_id = cause.body_id;
 
     debug!("normalize_param_env_or_error(unnormalized_env={:?})",
            unnormalized_env);
 
     let predicates: Vec<_> =
-        util::elaborate_predicates(tcx, unnormalized_env.caller_bounds.clone())
+        util::elaborate_predicates(tcx, unnormalized_env.caller_bounds.to_vec())
         .filter(|p| !p.is_global()) // (*)
         .collect();
 
@@ -434,24 +477,33 @@ pub fn normalize_param_env_or_error<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     debug!("normalize_param_env_or_error: elaborated-predicates={:?}",
            predicates);
 
-    let elaborated_env = unnormalized_env.with_caller_bounds(predicates);
+    let elaborated_env = ty::ParamEnv::new(tcx.intern_predicates(&predicates));
 
-    tcx.infer_ctxt(None, Some(elaborated_env), Reveal::NotSpecializable).enter(|infcx| {
-        let predicates = match fully_normalize(&infcx, cause,
-                                               &infcx.parameter_environment.caller_bounds) {
+    tcx.infer_ctxt(elaborated_env, Reveal::UserFacing).enter(|infcx| {
+        let predicates = match fully_normalize(
+                &infcx, cause,
+                // You would really want to pass infcx.param_env.caller_bounds here,
+                // but that is an interned slice, and fully_normalize takes &T and returns T, so
+                // without further refactoring, a slice can't be used. Luckily, we still have the
+                // predicate vector from which we created the ParamEnv in infcx, so we
+                // can pass that instead. It's roundabout and a bit brittle, but this code path
+                // ought to be refactored anyway, and until then it saves us from having to copy.
+                &predicates,
+        ) {
             Ok(predicates) => predicates,
             Err(errors) => {
                 infcx.report_fulfillment_errors(&errors);
                 // An unnormalized env is better than nothing.
-                return infcx.parameter_environment;
+                return infcx.param_env;
             }
         };
 
         debug!("normalize_param_env_or_error: normalized predicates={:?}",
             predicates);
 
+        let region_maps = RegionMaps::new();
         let free_regions = FreeRegionMap::new();
-        infcx.resolve_regions_and_report_errors(&free_regions, body_id);
+        infcx.resolve_regions_and_report_errors(region_context, &region_maps, &free_regions);
         let predicates = match infcx.fully_resolve(&predicates) {
             Ok(predicates) => predicates,
             Err(fixup_err) => {
@@ -464,19 +516,19 @@ pub fn normalize_param_env_or_error<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                 // all things considered.
                 tcx.sess.span_err(span, &fixup_err.to_string());
                 // An unnormalized env is better than nothing.
-                return infcx.parameter_environment;
+                return infcx.param_env;
             }
         };
 
         let predicates = match tcx.lift_to_global(&predicates) {
             Some(predicates) => predicates,
-            None => return infcx.parameter_environment
+            None => return infcx.param_env
         };
 
         debug!("normalize_param_env_or_error: resolved predicates={:?}",
             predicates);
 
-        infcx.parameter_environment.with_caller_bounds(predicates)
+        ty::ParamEnv::new(tcx.intern_predicates(&predicates))
     })
 }
 
@@ -538,7 +590,7 @@ pub fn normalize_and_test_predicates<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     debug!("normalize_and_test_predicates(predicates={:?})",
            predicates);
 
-    tcx.infer_ctxt(None, None, Reveal::All).enter(|infcx| {
+    tcx.infer_ctxt((), Reveal::All).enter(|infcx| {
         let mut selcx = SelectionContext::new(&infcx);
         let mut fulfill_cx = FulfillmentContext::new();
         let cause = ObligationCause::dummy();
@@ -567,20 +619,14 @@ pub fn get_vtable_methods<'a, 'tcx>(
     debug!("get_vtable_methods({:?})", trait_ref);
 
     supertraits(tcx, trait_ref).flat_map(move |trait_ref| {
-        tcx.populate_implementations_for_trait_if_necessary(trait_ref.def_id());
-
-        let trait_item_def_ids = tcx.impl_or_trait_items(trait_ref.def_id());
-        let trait_methods = (0..trait_item_def_ids.len()).filter_map(move |i| {
-            match tcx.impl_or_trait_item(trait_item_def_ids[i]) {
-                ty::MethodTraitItem(m) => Some(m),
-                _ => None
-            }
-        });
+        let trait_methods = tcx.associated_items(trait_ref.def_id())
+            .filter(|item| item.kind == ty::AssociatedKind::Method);
 
         // Now list each method's DefId and Substs (for within its trait).
         // If the method can never be called from this object, produce None.
         trait_methods.map(move |trait_method| {
             debug!("get_vtable_methods: trait_method={:?}", trait_method);
+            let def_id = trait_method.def_id;
 
             // Some methods cannot be called on an object; skip those.
             if !tcx.is_vtable_safe_method(trait_ref.def_id(), &trait_method) {
@@ -590,21 +636,26 @@ pub fn get_vtable_methods<'a, 'tcx>(
 
             // the method may have some early-bound lifetimes, add
             // regions for those
-            let substs = Substs::for_item(tcx, trait_method.def_id,
-                                            |_, _| tcx.mk_region(ty::ReErased),
-                                            |def, _| trait_ref.substs().type_for_def(def));
+            let substs = Substs::for_item(tcx, def_id,
+                                          |_, _| tcx.types.re_erased,
+                                          |def, _| trait_ref.substs().type_for_def(def));
+
+            // the trait type may have higher-ranked lifetimes in it;
+            // so erase them if they appear, so that we get the type
+            // at some particular call site
+            let substs = tcx.erase_late_bound_regions_and_normalize(&ty::Binder(substs));
 
             // It's possible that the method relies on where clauses that
             // do not hold for this particular set of type parameters.
             // Note that this method could then never be called, so we
             // do not want to try and trans it, in that case (see #23435).
-            let predicates = trait_method.predicates.instantiate_own(tcx, substs);
+            let predicates = tcx.predicates_of(def_id).instantiate_own(tcx, substs);
             if !normalize_and_test_predicates(tcx, predicates.predicates) {
                 debug!("get_vtable_methods: predicates do not hold");
                 return None;
             }
 
-            Some((trait_method.def_id, substs))
+            Some((def_id, substs))
         })
     })
 }
@@ -728,4 +779,20 @@ impl<'tcx> TraitObligation<'tcx> {
     fn self_ty(&self) -> ty::Binder<Ty<'tcx>> {
         ty::Binder(self.predicate.skip_binder().self_ty())
     }
+}
+
+pub fn provide(providers: &mut ty::maps::Providers) {
+    *providers = ty::maps::Providers {
+        is_object_safe: object_safety::is_object_safe_provider,
+        specialization_graph_of: specialize::specialization_graph_provider,
+        ..*providers
+    };
+}
+
+pub fn provide_extern(providers: &mut ty::maps::Providers) {
+    *providers = ty::maps::Providers {
+        is_object_safe: object_safety::is_object_safe_provider,
+        specialization_graph_of: specialize::specialization_graph_provider,
+        ..*providers
+    };
 }

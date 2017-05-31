@@ -15,33 +15,34 @@
 //! This API is completely unstable and subject to change.
 
 #![crate_name = "rustc_driver"]
-#![unstable(feature = "rustc_private", issue = "27812")]
 #![crate_type = "dylib"]
 #![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![cfg_attr(not(stage0), deny(warnings))]
+#![deny(warnings)]
 
 #![feature(box_syntax)]
-#![feature(dotdot_in_tuple_patterns)]
 #![feature(libc)]
 #![feature(quote)]
 #![feature(rustc_diagnostic_macros)]
-#![feature(rustc_private)]
 #![feature(set_stdio)]
-#![feature(staged_api)]
-#![cfg_attr(stage0, feature(question_mark))]
+
+#![cfg_attr(stage0, unstable(feature = "rustc_private", issue = "27812"))]
+#![cfg_attr(stage0, feature(rustc_private))]
+#![cfg_attr(stage0, feature(staged_api))]
+#![cfg_attr(stage0, feature(loop_break_value))]
 
 extern crate arena;
-extern crate flate;
 extern crate getopts;
 extern crate graphviz;
+extern crate env_logger;
 extern crate libc;
 extern crate rustc;
 extern crate rustc_back;
 extern crate rustc_borrowck;
 extern crate rustc_const_eval;
+extern crate rustc_data_structures;
 extern crate rustc_errors as errors;
 extern crate rustc_passes;
 extern crate rustc_lint;
@@ -55,10 +56,8 @@ extern crate rustc_save_analysis;
 extern crate rustc_trans;
 extern crate rustc_typeck;
 extern crate serialize;
-extern crate rustc_llvm as llvm;
 #[macro_use]
 extern crate log;
-#[macro_use]
 extern crate syntax;
 extern crate syntax_ext;
 extern crate syntax_pos;
@@ -68,19 +67,23 @@ use pretty::{PpMode, UserIdentifiedItem};
 
 use rustc_resolve as resolve;
 use rustc_save_analysis as save;
+use rustc_save_analysis::DumpHandler;
 use rustc_trans::back::link;
-use rustc_trans::back::write::{create_target_machine, RELOC_MODEL_ARGS, CODE_GEN_MODEL_ARGS};
+use rustc_trans::back::write::{RELOC_MODEL_ARGS, CODE_GEN_MODEL_ARGS};
 use rustc::dep_graph::DepGraph;
 use rustc::session::{self, config, Session, build_session, CompileResult};
 use rustc::session::config::{Input, PrintRequest, OutputType, ErrorOutputType};
 use rustc::session::config::nightly_options;
-use rustc::session::early_error;
+use rustc::session::{early_error, early_warn};
 use rustc::lint::Lint;
 use rustc::lint;
-use rustc_metadata::loader;
+use rustc_metadata::locator;
 use rustc_metadata::cstore::CStore;
 use rustc::util::common::time;
 
+use serialize::json::ToJson;
+
+use std::any::Any;
 use std::cmp::max;
 use std::cmp::Ordering::Equal;
 use std::default::Default;
@@ -94,12 +97,11 @@ use std::str;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use syntax::{ast, json};
+use syntax::ast;
 use syntax::codemap::{CodeMap, FileLoader, RealFileLoader};
 use syntax::feature_gate::{GatedCfg, UnstableFeatures};
 use syntax::parse::{self, PResult};
-use syntax_pos::MultiSpan;
-use errors::emitter::Emitter;
+use syntax_pos::{DUMMY_SP, MultiSpan};
 
 #[cfg(test)]
 pub mod test;
@@ -116,8 +118,7 @@ const BUG_REPORT_URL: &'static str = "https://github.com/rust-lang/rust/blob/mas
 fn abort_msg(err_count: usize) -> String {
     match err_count {
         0 => "aborting with no errors (maybe a bug?)".to_owned(),
-        1 => "aborting due to previous error".to_owned(),
-        e => format!("aborting due to {} previous errors", e),
+        _ => "aborting due to previous error(s)".to_owned(),
     }
 }
 
@@ -179,7 +180,7 @@ pub fn run_compiler<'a>(args: &[String],
     let (sopts, cfg) = config::build_session_options_and_crate_config(&matches);
 
     if sopts.debugging_opts.debug_llvm {
-        unsafe { llvm::LLVMRustSetDebug(1); }
+        rustc_trans::enable_llvm_debug();
     }
 
     let descriptions = diagnostics_registry();
@@ -201,28 +202,25 @@ pub fn run_compiler<'a>(args: &[String],
     };
 
     let dep_graph = DepGraph::new(sopts.build_dep_graph());
-    let cstore = Rc::new(CStore::new(&dep_graph));
+    let cstore = Rc::new(CStore::new(&dep_graph, box rustc_trans::LlvmMetadataLoader));
 
     let loader = file_loader.unwrap_or(box RealFileLoader);
-    let codemap = Rc::new(CodeMap::with_file_loader(loader));
-    let sess = session::build_session_with_codemap(sopts,
-                                                   &dep_graph,
-                                                   input_file_path,
-                                                   descriptions,
-                                                   cstore.clone(),
-                                                   codemap,
-                                                   emitter_dest);
+    let codemap = Rc::new(CodeMap::with_file_loader(loader, sopts.file_path_mapping()));
+    let mut sess = session::build_session_with_codemap(
+        sopts, &dep_graph, input_file_path, descriptions, cstore.clone(), codemap, emitter_dest,
+    );
+    rustc_trans::init(&sess);
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
+
     let mut cfg = config::build_configuration(&sess, cfg);
     target_features::add_configuration(&mut cfg, &sess);
+    sess.parse_sess.config = cfg;
 
-    do_or_return!(callbacks.late_callback(&matches, &sess, &cfg, &input, &odir, &ofile),
-                  Some(sess));
+    do_or_return!(callbacks.late_callback(&matches, &sess, &input, &odir, &ofile), Some(sess));
 
     let plugins = sess.opts.debugging_opts.extra_plugins.clone();
     let control = callbacks.build_controller(&sess, &matches);
-    (driver::compile_input(&sess, &cstore, cfg, &input, &odir, &ofile,
-                           Some(plugins), &control),
+    (driver::compile_input(&sess, &cstore, &input, &odir, &ofile, Some(plugins), &control),
      Some(sess))
 }
 
@@ -236,7 +234,7 @@ fn make_output(matches: &getopts::Matches) -> (Option<PathBuf>, Option<PathBuf>)
 // Extract input (string or file and optional path) from matches.
 fn make_input(free_matches: &[String]) -> Option<(Input, Option<PathBuf>)> {
     if free_matches.len() == 1 {
-        let ifile = &free_matches[0][..];
+        let ifile = &free_matches[0];
         if ifile == "-" {
             let mut src = String::new();
             io::stdin().read_to_string(&mut src).unwrap();
@@ -310,7 +308,6 @@ pub trait CompilerCalls<'a> {
     fn late_callback(&mut self,
                      _: &getopts::Matches,
                      _: &Session,
-                     _: &ast::CrateConfig,
                      _: &Input,
                      _: &Option<PathBuf>,
                      _: &Option<PathBuf>)
@@ -346,7 +343,7 @@ pub trait CompilerCalls<'a> {
 
     // Create a CompilController struct for controlling the behaviour of
     // compilation.
-    fn build_controller(&mut self, &Session, &getopts::Matches) -> CompileController<'a>;
+    fn build_controller(&mut self, _: &Session, _: &getopts::Matches) -> CompileController<'a>;
 }
 
 // CompilerCalls instance for a regular rustc build.
@@ -378,37 +375,11 @@ fn handle_explain(code: &str,
     }
 }
 
-fn check_cfg(cfg: &ast::CrateConfig,
-             output: ErrorOutputType) {
-    let emitter: Box<Emitter> = match output {
-        config::ErrorOutputType::HumanReadable(color_config) => {
-            Box::new(errors::emitter::EmitterWriter::stderr(color_config, None))
-        }
-        config::ErrorOutputType::Json => Box::new(json::JsonEmitter::basic()),
-    };
-    let handler = errors::Handler::with_emitter(true, false, emitter);
-
-    let mut saw_invalid_predicate = false;
-    for item in cfg.iter() {
-        if item.is_meta_item_list() {
-            saw_invalid_predicate = true;
-            handler.emit(&MultiSpan::new(),
-                         &format!("invalid predicate in --cfg command line argument: `{}`",
-                                  item.name()),
-                            errors::Level::Fatal);
-        }
-    }
-
-    if saw_invalid_predicate {
-        panic!(errors::FatalError);
-    }
-}
-
 impl<'a> CompilerCalls<'a> for RustcDefaultCalls {
     fn early_callback(&mut self,
                       matches: &getopts::Matches,
                       _: &config::Options,
-                      cfg: &ast::CrateConfig,
+                      _: &ast::CrateConfig,
                       descriptions: &errors::registry::Registry,
                       output: ErrorOutputType)
                       -> Compilation {
@@ -417,7 +388,6 @@ impl<'a> CompilerCalls<'a> for RustcDefaultCalls {
             return Compilation::Stop;
         }
 
-        check_cfg(cfg, output);
         Compilation::Continue
     }
 
@@ -438,20 +408,20 @@ impl<'a> CompilerCalls<'a> for RustcDefaultCalls {
                     return None;
                 }
                 let dep_graph = DepGraph::new(sopts.build_dep_graph());
-                let cstore = Rc::new(CStore::new(&dep_graph));
-                let sess = build_session(sopts.clone(),
+                let cstore = Rc::new(CStore::new(&dep_graph, box rustc_trans::LlvmMetadataLoader));
+                let mut sess = build_session(sopts.clone(),
                     &dep_graph,
                     None,
                     descriptions.clone(),
                     cstore.clone());
+                rustc_trans::init(&sess);
                 rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
                 let mut cfg = config::build_configuration(&sess, cfg.clone());
                 target_features::add_configuration(&mut cfg, &sess);
-                let should_stop = RustcDefaultCalls::print_crate_info(&sess,
-                                                                      &cfg,
-                                                                      None,
-                                                                      odir,
-                                                                      ofile);
+                sess.parse_sess.config = cfg;
+                let should_stop =
+                    RustcDefaultCalls::print_crate_info(&sess, None, odir, ofile);
+
                 if should_stop == Compilation::Stop {
                     return None;
                 }
@@ -460,19 +430,16 @@ impl<'a> CompilerCalls<'a> for RustcDefaultCalls {
             1 => panic!("make_input should have provided valid inputs"),
             _ => early_error(sopts.error_format, "multiple input filenames provided"),
         }
-
-        None
     }
 
     fn late_callback(&mut self,
                      matches: &getopts::Matches,
                      sess: &Session,
-                     cfg: &ast::CrateConfig,
                      input: &Input,
                      odir: &Option<PathBuf>,
                      ofile: &Option<PathBuf>)
                      -> Compilation {
-        RustcDefaultCalls::print_crate_info(sess, cfg, Some(input), odir, ofile)
+        RustcDefaultCalls::print_crate_info(sess, Some(input), odir, ofile)
             .and_then(|| RustcDefaultCalls::list_metadata(sess, matches, input))
     }
 
@@ -491,13 +458,14 @@ impl<'a> CompilerCalls<'a> for RustcDefaultCalls {
                 };
                 control.after_hir_lowering.callback = box move |state| {
                     pretty::print_after_hir_lowering(state.session,
-                                                     state.ast_map.unwrap(),
+                                                     state.hir_map.unwrap(),
                                                      state.analysis.unwrap(),
                                                      state.resolutions.unwrap(),
                                                      state.input,
                                                      &state.expanded_crate.take().unwrap(),
                                                      state.crate_name.unwrap(),
                                                      ppm,
+                                                     state.arena.unwrap(),
                                                      state.arenas.unwrap(),
                                                      opt_uii.clone(),
                                                      state.out_file);
@@ -529,7 +497,8 @@ impl<'a> CompilerCalls<'a> for RustcDefaultCalls {
             control.after_hir_lowering.stop = Compilation::Stop;
         }
 
-        if !sess.opts.output_types.keys().any(|&i| i == OutputType::Exe) {
+        if !sess.opts.output_types.keys().any(|&i| i == OutputType::Exe ||
+                                                   i == OutputType::Metadata) {
             control.after_llvm.stop = Compilation::Stop;
         }
 
@@ -540,14 +509,25 @@ impl<'a> CompilerCalls<'a> for RustcDefaultCalls {
                                         state.expanded_crate.unwrap(),
                                         state.analysis.unwrap(),
                                         state.crate_name.unwrap(),
-                                        state.out_dir,
-                                        save_analysis_format(state.session))
+                                        DumpHandler::new(save_analysis_format(state.session),
+                                                         state.out_dir,
+                                                         state.crate_name.unwrap()))
                 });
             };
             control.after_analysis.run_callback_on_error = true;
             control.make_glob_map = resolve::MakeGlobMap::Yes;
         }
 
+        if sess.print_fuel_crate.is_some() {
+            let old_callback = control.compilation_done.callback;
+            control.compilation_done.callback = box move |state| {
+                old_callback(state);
+                let sess = state.session;
+                println!("Fuel used by {}: {}",
+                    sess.print_fuel_crate.as_ref().unwrap(),
+                    sess.print_fuel.get());
+            }
+        }
         control
     }
 }
@@ -578,8 +558,11 @@ impl RustcDefaultCalls {
                 &Input::File(ref ifile) => {
                     let path = &(*ifile);
                     let mut v = Vec::new();
-                    loader::list_file_metadata(&sess.target.target, path, &mut v)
-                        .unwrap();
+                    locator::list_file_metadata(&sess.target.target,
+                                                path,
+                                                sess.cstore.metadata_loader(),
+                                                &mut v)
+                            .unwrap();
                     println!("{}", String::from_utf8(v).unwrap());
                 }
                 &Input::Str { .. } => {
@@ -594,7 +577,6 @@ impl RustcDefaultCalls {
 
 
     fn print_crate_info(sess: &Session,
-                        cfg: &ast::CrateConfig,
                         input: Option<&Input>,
                         odir: &Option<PathBuf>,
                         ofile: &Option<PathBuf>)
@@ -624,6 +606,7 @@ impl RustcDefaultCalls {
                     println!("{}", targets.join("\n"));
                 },
                 PrintRequest::Sysroot => println!("{}", sess.sysroot().display()),
+                PrintRequest::TargetSpec => println!("{}", sess.target.target.to_json().pretty()),
                 PrintRequest::FileNames |
                 PrintRequest::CrateName => {
                     let input = match input {
@@ -650,33 +633,41 @@ impl RustcDefaultCalls {
                     let allow_unstable_cfg = UnstableFeatures::from_environment()
                         .is_nightly_build();
 
-                    for cfg in cfg {
-                        if !allow_unstable_cfg && GatedCfg::gate(&*cfg).is_some() {
-                            continue;
+                    let mut cfgs = Vec::new();
+                    for &(name, ref value) in sess.parse_sess.config.iter() {
+                        let gated_cfg = GatedCfg::gate(&ast::MetaItem {
+                            name: name,
+                            node: ast::MetaItemKind::Word,
+                            span: DUMMY_SP,
+                        });
+
+                        // Note that crt-static is a specially recognized cfg
+                        // directive that's printed out here as part of
+                        // rust-lang/rust#37406, but in general the
+                        // `target_feature` cfg is gated under
+                        // rust-lang/rust#29717. For now this is just
+                        // specifically allowing the crt-static cfg and that's
+                        // it, this is intended to get into Cargo and then go
+                        // through to build scripts.
+                        let value = value.as_ref().map(|s| s.as_str());
+                        let value = value.as_ref().map(|s| s.as_ref());
+                        if name != "target_feature" || value != Some("crt-static") {
+                            if !allow_unstable_cfg && gated_cfg.is_some() {
+                                continue;
+                            }
                         }
 
-                        if cfg.is_word() {
-                            println!("{}", cfg.name());
-                        } else if let Some(s) = cfg.value_str() {
-                            println!("{}=\"{}\"", cfg.name(), s);
-                        } else if cfg.is_meta_item_list() {
-                            // Right now there are not and should not be any
-                            // MetaItemKind::List items in the configuration returned by
-                            // `build_configuration`.
-                            panic!("Found an unexpected list in cfg attribute '{}'!", cfg.name())
+                        cfgs.push(if let Some(value) = value {
+                            format!("{}=\"{}\"", name, value)
                         } else {
-                            // There also shouldn't be literals.
-                            panic!("Found an unexpected literal in cfg attribute '{}'!", cfg.name())
-                        }
+                            format!("{}", name)
+                        });
                     }
-                }
-                PrintRequest::TargetCPUs => {
-                    let tm = create_target_machine(sess);
-                    unsafe { llvm::LLVMRustPrintTargetCPUs(tm); }
-                }
-                PrintRequest::TargetFeatures => {
-                    let tm = create_target_machine(sess);
-                    unsafe { llvm::LLVMRustPrintTargetFeatures(tm); }
+
+                    cfgs.sort();
+                    for cfg in cfgs {
+                        println!("{}", cfg);
+                    }
                 }
                 PrintRequest::RelocationModels => {
                     println!("Available relocation models:");
@@ -691,6 +682,9 @@ impl RustcDefaultCalls {
                         println!("    {}", name);
                     }
                     println!("");
+                }
+                PrintRequest::TargetCPUs | PrintRequest::TargetFeatures => {
+                    rustc_trans::print(*req, sess);
                 }
             }
         }
@@ -729,6 +723,7 @@ pub fn version(binary: &str, matches: &getopts::Matches) {
         println!("commit-date: {}", unw(commit_date_str()));
         println!("host: {}", config::host_triple());
         println!("release: {}", unw(release_str()));
+        rustc_trans::print_version();
     }
 }
 
@@ -766,7 +761,7 @@ Available lint options:
               Allow <foo>
     -D <foo>           Deny <foo>
     -F <foo>           Forbid <foo> \
-              (deny, and deny all overrides)
+              (deny <foo> and all attempts to override)
 
 ");
 
@@ -827,7 +822,7 @@ Available lint options:
         for lint in lints {
             let name = lint.name_lower().replace("_", "-");
             println!("    {}  {:7.7}  {}",
-                     padded(&name[..]),
+                     padded(&name),
                      lint.default_level.as_str(),
                      lint.desc);
         }
@@ -865,7 +860,7 @@ Available lint options:
                          .map(|x| x.to_string().replace("_", "-"))
                          .collect::<Vec<String>>()
                          .join(", ");
-            println!("    {}  {}", padded(&name[..]), desc);
+            println!("    {}  {}", padded(&name), desc);
         }
         println!("\n");
     };
@@ -933,7 +928,7 @@ fn print_flag_list<T>(cmdline_opt: &str,
 /// should continue, returns a getopts::Matches object parsed from args,
 /// otherwise returns None.
 ///
-/// The compiler's handling of options is a little complication as it ties into
+/// The compiler's handling of options is a little complicated as it ties into
 /// our stability story, and it's even *more* complicated by historical
 /// accidents. The current intention of each compiler option is to have one of
 /// three modes:
@@ -972,7 +967,7 @@ pub fn handle_options(args: &[String]) -> Option<getopts::Matches> {
                                                  .into_iter()
                                                  .map(|x| x.opt_group)
                                                  .collect();
-    let matches = match getopts::getopts(&args[..], &all_groups) {
+    let matches = match getopts::getopts(&args, &all_groups) {
         Ok(m) => m,
         Err(f) => early_error(ErrorOutputType::default(), &f.to_string()),
     };
@@ -1015,10 +1010,13 @@ pub fn handle_options(args: &[String]) -> Option<getopts::Matches> {
         return None;
     }
 
+    if cg_flags.iter().any(|x| *x == "no-stack-check") {
+        early_warn(ErrorOutputType::default(),
+                   "the --no-stack-check flag is deprecated and does nothing");
+    }
+
     if cg_flags.contains(&"passes=list".to_string()) {
-        unsafe {
-            ::llvm::LLVMRustPrintPasses();
-        }
+        rustc_trans::print_passes();
         return None;
     }
 
@@ -1033,15 +1031,34 @@ pub fn handle_options(args: &[String]) -> Option<getopts::Matches> {
 fn parse_crate_attrs<'a>(sess: &'a Session, input: &Input) -> PResult<'a, Vec<ast::Attribute>> {
     match *input {
         Input::File(ref ifile) => {
-            parse::parse_crate_attrs_from_file(ifile, Vec::new(), &sess.parse_sess)
+            parse::parse_crate_attrs_from_file(ifile, &sess.parse_sess)
         }
         Input::Str { ref name, ref input } => {
-            parse::parse_crate_attrs_from_source_str(name.clone(),
-                                                     input.clone(),
-                                                     Vec::new(),
-                                                     &sess.parse_sess)
+            parse::parse_crate_attrs_from_source_str(name.clone(), input.clone(), &sess.parse_sess)
         }
     }
+}
+
+/// Runs `f` in a suitable thread for running `rustc`; returns a
+/// `Result` with either the return value of `f` or -- if a panic
+/// occurs -- the panic value.
+pub fn in_rustc_thread<F, R>(f: F) -> Result<R, Box<Any + Send>>
+    where F: FnOnce() -> R + Send + 'static,
+          R: Send + 'static,
+{
+    // Temporarily have stack size set to 16MB to deal with nom-using crates failing
+    const STACK_SIZE: usize = 16 * 1024 * 1024; // 16MB
+
+    let mut cfg = thread::Builder::new().name("rustc".to_string());
+
+    // FIXME: Hacks on hacks. If the env is trying to override the stack size
+    // then *don't* set it explicitly.
+    if env::var_os("RUST_MIN_STACK").is_none() {
+        cfg = cfg.stack_size(STACK_SIZE);
+    }
+
+    let thread = cfg.spawn(f);
+    thread.unwrap().join()
 }
 
 /// Run a procedure which will detect panics in the compiler and print nicer
@@ -1050,9 +1067,6 @@ fn parse_crate_attrs<'a>(sess: &'a Session, input: &Input) -> PResult<'a, Vec<as
 /// The diagnostic emitter yielded to the procedure should be used for reporting
 /// errors of the compiler.
 pub fn monitor<F: FnOnce() + Send + 'static>(f: F) {
-    // Temporarily have stack size set to 16MB to deal with nom-using crates failing
-    const STACK_SIZE: usize = 16 * 1024 * 1024; // 16MB
-
     struct Sink(Arc<Mutex<Vec<u8>>>);
     impl Write for Sink {
         fn write(&mut self, data: &[u8]) -> io::Result<usize> {
@@ -1066,20 +1080,12 @@ pub fn monitor<F: FnOnce() + Send + 'static>(f: F) {
     let data = Arc::new(Mutex::new(Vec::new()));
     let err = Sink(data.clone());
 
-    let mut cfg = thread::Builder::new().name("rustc".to_string());
+    let result = in_rustc_thread(move || {
+        io::set_panic(Some(box err));
+        f()
+    });
 
-    // FIXME: Hacks on hacks. If the env is trying to override the stack size
-    // then *don't* set it explicitly.
-    if env::var_os("RUST_MIN_STACK").is_none() {
-        cfg = cfg.stack_size(STACK_SIZE);
-    }
-
-    let thread = cfg.spawn(move || {
-         io::set_panic(Some(box err));
-         f()
-     });
-
-     if let Err(value) = thread.unwrap().join() {
+    if let Err(value) = result {
         // Thread panicked without emitting a fatal diagnostic
         if !value.is::<errors::FatalError>() {
             let emitter =
@@ -1098,7 +1104,7 @@ pub fn monitor<F: FnOnce() + Send + 'static>(f: F) {
                       format!("we would appreciate a bug report: {}", BUG_REPORT_URL)];
             for note in &xs {
                 handler.emit(&MultiSpan::new(),
-                             &note[..],
+                             &note,
                              errors::Level::Note);
             }
             if match env::var_os("RUST_BACKTRACE") {
@@ -1141,8 +1147,18 @@ pub fn diagnostics_registry() -> errors::registry::Registry {
     Registry::new(&all_errors)
 }
 
+fn get_args() -> Vec<String> {
+    env::args_os().enumerate()
+        .map(|(i, arg)| arg.into_string().unwrap_or_else(|arg| {
+             early_error(ErrorOutputType::default(),
+                         &format!("Argument {} is not valid Unicode: {:?}", i, arg))
+         }))
+        .collect()
+}
+
 pub fn main() {
-    let result = run(|| run_compiler(&env::args().collect::<Vec<_>>(),
+    env_logger::init().unwrap();
+    let result = run(|| run_compiler(&get_args(),
                                      &mut RustcDefaultCalls,
                                      None,
                                      None));

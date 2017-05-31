@@ -58,10 +58,11 @@
 use encoder::EncodeContext;
 use index::Index;
 use schema::*;
+use isolated_encoder::IsolatedEncoder;
 
-use rustc::dep_graph::DepNode;
 use rustc::hir;
 use rustc::hir::def_id::DefId;
+use rustc::middle::cstore::EncodedMetadataHash;
 use rustc::ty::TyCtxt;
 use syntax::ast;
 
@@ -90,7 +91,7 @@ impl<'a, 'b, 'tcx> DerefMut for IndexBuilder<'a, 'b, 'tcx> {
 impl<'a, 'b, 'tcx> IndexBuilder<'a, 'b, 'tcx> {
     pub fn new(ecx: &'a mut EncodeContext<'b, 'tcx>) -> Self {
         IndexBuilder {
-            items: Index::new(ecx.tcx.map.num_local_def_ids()),
+            items: Index::new(ecx.tcx.hir.definitions().def_index_counts_lo_hi()),
             ecx: ecx,
         }
     }
@@ -112,16 +113,35 @@ impl<'a, 'b, 'tcx> IndexBuilder<'a, 'b, 'tcx> {
     /// holds, and that it is therefore not gaining "secret" access to
     /// bits of HIR or other state that would not be trackd by the
     /// content system.
-    pub fn record<DATA>(&mut self,
-                        id: DefId,
-                        op: fn(&mut EncodeContext<'b, 'tcx>, DATA) -> Entry<'tcx>,
-                        data: DATA)
+    pub fn record<'x, DATA>(&'x mut self,
+                            id: DefId,
+                            op: fn(&mut IsolatedEncoder<'x, 'b, 'tcx>, DATA) -> Entry<'tcx>,
+                            data: DATA)
         where DATA: DepGraphRead
     {
-        let _task = self.tcx.dep_graph.in_task(DepNode::MetaData(id));
-        data.read(self.tcx);
-        let entry = op(&mut self.ecx, data);
-        self.items.record(id, self.ecx.lazy(&entry));
+        assert!(id.is_local());
+        let tcx: TyCtxt<'b, 'tcx, 'tcx> = self.ecx.tcx;
+
+        // We don't track this since we are explicitly computing the incr. comp.
+        // hashes anyway. In theory we could do some tracking here and use it to
+        // avoid rehashing things (and instead cache the hashes) but it's
+        // unclear whether that would be a win since hashing is cheap enough.
+        let _task = tcx.dep_graph.in_ignore();
+
+        let ecx: &'x mut EncodeContext<'b, 'tcx> = &mut *self.ecx;
+        let mut entry_builder = IsolatedEncoder::new(ecx);
+        let entry = op(&mut entry_builder, data);
+        let entry = entry_builder.lazy(&entry);
+
+        let (fingerprint, ecx) = entry_builder.finish();
+        if let Some(hash) = fingerprint {
+            ecx.metadata_hashes.entry_hashes.push(EncodedMetadataHash {
+                def_index: id.index,
+                hash: hash,
+            });
+        }
+
+        self.items.record(id, entry);
     }
 
     pub fn into_items(self) -> Index {
@@ -138,11 +158,11 @@ pub trait DepGraphRead {
 }
 
 impl DepGraphRead for DefId {
-    fn read(&self, _tcx: TyCtxt) { }
+    fn read(&self, _tcx: TyCtxt) {}
 }
 
 impl DepGraphRead for ast::NodeId {
-    fn read(&self, _tcx: TyCtxt) { }
+    fn read(&self, _tcx: TyCtxt) {}
 }
 
 impl<T> DepGraphRead for Option<T>
@@ -179,14 +199,14 @@ macro_rules! read_tuple {
         }
     }
 }
-read_tuple!(A,B);
-read_tuple!(A,B,C);
+read_tuple!(A, B);
+read_tuple!(A, B, C);
 
 macro_rules! read_hir {
     ($t:ty) => {
         impl<'tcx> DepGraphRead for &'tcx $t {
             fn read(&self, tcx: TyCtxt) {
-                tcx.map.read(self.id);
+                tcx.hir.read(self.id);
             }
         }
     }
@@ -195,6 +215,7 @@ read_hir!(hir::Item);
 read_hir!(hir::ImplItem);
 read_hir!(hir::TraitItem);
 read_hir!(hir::ForeignItem);
+read_hir!(hir::MacroDef);
 
 /// Leaks access to a value of type T without any tracking. This is
 /// suitable for ambiguous types like `usize`, which *could* represent
@@ -208,7 +229,7 @@ read_hir!(hir::ForeignItem);
 pub struct Untracked<T>(pub T);
 
 impl<T> DepGraphRead for Untracked<T> {
-    fn read(&self, _tcx: TyCtxt) { }
+    fn read(&self, _tcx: TyCtxt) {}
 }
 
 /// Newtype that can be used to package up misc data extracted from a
@@ -219,6 +240,6 @@ pub struct FromId<T>(pub ast::NodeId, pub T);
 
 impl<T> DepGraphRead for FromId<T> {
     fn read(&self, tcx: TyCtxt) {
-        tcx.map.read(self.0);
+        tcx.hir.read(self.0);
     }
 }

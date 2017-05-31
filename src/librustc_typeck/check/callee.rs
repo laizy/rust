@@ -10,13 +10,13 @@
 
 use super::{DeferredCallResolution, Expectation, FnCtxt, TupleArgumentsFlag};
 
-use CrateCtxt;
 use hir::def::Def;
 use hir::def_id::{DefId, LOCAL_CRATE};
 use rustc::{infer, traits};
-use rustc::ty::{self, LvaluePreference, Ty};
-use syntax::parse::token;
-use syntax::ptr::P;
+use rustc::ty::{self, TyCtxt, LvaluePreference, Ty};
+use rustc::ty::subst::Subst;
+use syntax::abi;
+use syntax::symbol::Symbol;
 use syntax_pos::Span;
 
 use rustc::hir;
@@ -24,13 +24,10 @@ use rustc::hir;
 /// Check that it is legal to call methods of the trait corresponding
 /// to `trait_id` (this only cares about the trait, not the specific
 /// method that is called)
-pub fn check_legal_trait_for_method_call(ccx: &CrateCtxt, span: Span, trait_id: DefId) {
-    if ccx.tcx.lang_items.drop_trait() == Some(trait_id) {
-        struct_span_err!(ccx.tcx.sess,
-                         span,
-                         E0040,
-                         "explicit use of destructor method")
-            .span_label(span, &format!("explicit destructor calls not allowed"))
+pub fn check_legal_trait_for_method_call(tcx: TyCtxt, span: Span, trait_id: DefId) {
+    if tcx.lang_items.drop_trait() == Some(trait_id) {
+        struct_span_err!(tcx.sess, span, E0040, "explicit use of destructor method")
+            .span_label(span, "explicit destructor calls not allowed")
             .emit();
     }
 }
@@ -45,7 +42,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
     pub fn check_call(&self,
                       call_expr: &'gcx hir::Expr,
                       callee_expr: &'gcx hir::Expr,
-                      arg_exprs: &'gcx [P<hir::Expr>],
+                      arg_exprs: &'gcx [hir::Expr],
                       expected: Expectation<'tcx>)
                       -> Ty<'tcx> {
         let original_callee_ty = self.check_expr(callee_expr);
@@ -58,7 +55,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             })
             .next();
         let callee_ty = autoderef.unambiguous_final_ty();
-        autoderef.finalize(LvaluePreference::NoPreference, Some(callee_expr));
+        autoderef.finalize(LvaluePreference::NoPreference, callee_expr);
 
         let output = match result {
             None => {
@@ -103,7 +100,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         // If the callee is a bare function or a closure, then we're all set.
         match self.structurally_resolved_type(callee_expr.span, adjusted_ty).sty {
             ty::TyFnDef(..) | ty::TyFnPtr(_) => {
-                self.write_autoderef_adjustment(callee_expr.id, autoderefs);
+                self.apply_autoderef_adjustment(callee_expr.id, autoderefs, adjusted_ty);
                 return Some(CallStep::Builtin);
             }
 
@@ -114,10 +111,10 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 // haven't yet decided on whether the closure is fn vs
                 // fnmut vs fnonce. If so, we have to defer further processing.
                 if self.closure_kind(def_id).is_none() {
-                    let closure_ty = self.closure_type(def_id, substs);
+                    let closure_ty = self.closure_type(def_id).subst(self.tcx, substs.substs);
                     let fn_sig = self.replace_late_bound_regions_with_fresh_var(call_expr.span,
                                                                    infer::FnCall,
-                                                                   &closure_ty.sig)
+                                                                   &closure_ty)
                         .0;
                     self.record_deferred_call_resolution(def_id,
                                                          Box::new(CallResolution {
@@ -159,24 +156,27 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                   -> Option<ty::MethodCallee<'tcx>> {
         // Try the options that are least restrictive on the caller first.
         for &(opt_trait_def_id, method_name) in
-            &[(self.tcx.lang_items.fn_trait(), token::intern("call")),
-              (self.tcx.lang_items.fn_mut_trait(), token::intern("call_mut")),
-              (self.tcx.lang_items.fn_once_trait(), token::intern("call_once"))] {
+            &[(self.tcx.lang_items.fn_trait(), Symbol::intern("call")),
+              (self.tcx.lang_items.fn_mut_trait(), Symbol::intern("call_mut")),
+              (self.tcx.lang_items.fn_once_trait(), Symbol::intern("call_once"))] {
             let trait_def_id = match opt_trait_def_id {
                 Some(def_id) => def_id,
                 None => continue,
             };
 
             match self.lookup_method_in_trait_adjusted(call_expr.span,
-                                                       Some(&callee_expr),
+                                                       Some(super::AdjustedRcvr {
+                                                           rcvr_expr: callee_expr,
+                                                           autoderefs,
+                                                           unsize: false
+                                                       }),
                                                        method_name,
                                                        trait_def_id,
-                                                       autoderefs,
-                                                       false,
                                                        adjusted_ty,
                                                        None) {
                 None => continue,
-                Some(method_callee) => {
+                Some(ok) => {
+                    let method_callee = self.register_infer_ok_obligations(ok);
                     return Some(method_callee);
                 }
             }
@@ -188,29 +188,44 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
     fn confirm_builtin_call(&self,
                             call_expr: &hir::Expr,
                             callee_ty: Ty<'tcx>,
-                            arg_exprs: &'gcx [P<hir::Expr>],
+                            arg_exprs: &'gcx [hir::Expr],
                             expected: Expectation<'tcx>)
                             -> Ty<'tcx> {
-        let error_fn_sig;
-
-        let fn_sig = match callee_ty.sty {
-            ty::TyFnDef(.., &ty::BareFnTy { ref sig, .. }) |
-            ty::TyFnPtr(&ty::BareFnTy { ref sig, .. }) => sig,
-            _ => {
-                let mut err = self.type_error_struct(call_expr.span,
-                                                     |actual| {
-                                                         format!("expected function, found `{}`",
-                                                                 actual)
-                                                     },
-                                                     callee_ty);
+        let (fn_sig, def_span) = match callee_ty.sty {
+            ty::TyFnDef(def_id, .., sig) => {
+                (sig, self.tcx.hir.span_if_local(def_id))
+            }
+            ty::TyFnPtr(sig) => (sig, None),
+            ref t => {
+                let mut unit_variant = None;
+                if let &ty::TyAdt(adt_def, ..) = t {
+                    if adt_def.is_enum() {
+                        if let hir::ExprCall(ref expr, _) = call_expr.node {
+                            unit_variant = Some(self.tcx.hir.node_to_pretty_string(expr.id))
+                        }
+                    }
+                }
+                let mut err = if let Some(path) = unit_variant {
+                    let mut err = self.type_error_struct(call_expr.span, |_| {
+                        format!("`{}` is being called, but it is not a function", path)
+                    }, callee_ty);
+                    err.help(&format!("did you mean to write `{}`?", path));
+                    err
+                } else {
+                    self.type_error_struct(call_expr.span, |actual| {
+                        format!("expected function, found `{}`", actual)
+                    }, callee_ty)
+                };
 
                 if let hir::ExprCall(ref expr, _) = call_expr.node {
-                    let tcx = self.tcx;
-                    if let Some(pr) = tcx.def_map.borrow().get(&expr.id) {
-                        if pr.depth == 0 && pr.base_def != Def::Err {
-                            if let Some(span) = tcx.map.span_if_local(pr.base_def.def_id()) {
-                                err.span_note(span, "defined here");
-                            }
+                    let def = if let hir::ExprPath(ref qpath) = expr.node {
+                        self.tables.borrow().qpath_def(qpath, expr.id)
+                    } else {
+                        Def::Err
+                    };
+                    if def != Def::Err {
+                        if let Some(span) = self.tcx.hir.span_if_local(def.def_id()) {
+                            err.span_note(span, "defined here");
                         }
                     }
                 }
@@ -220,13 +235,13 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 // This is the "default" function signature, used in case of error.
                 // In that case, we check each argument against "error" in order to
                 // set up all the node type bindings.
-                error_fn_sig = ty::Binder(ty::FnSig {
-                    inputs: self.err_args(arg_exprs.len()),
-                    output: self.tcx.types.err,
-                    variadic: false,
-                });
-
-                &error_fn_sig
+                (ty::Binder(self.tcx.mk_fn_sig(
+                    self.err_args(arg_exprs.len()).into_iter(),
+                    self.tcx.types.err,
+                    false,
+                    hir::Unsafety::Normal,
+                    abi::Abi::Rust
+                )), None)
             }
         };
 
@@ -236,29 +251,30 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         // previously appeared within a `Binder<>` and hence would not
         // have been normalized before.
         let fn_sig =
-            self.replace_late_bound_regions_with_fresh_var(call_expr.span, infer::FnCall, fn_sig)
+            self.replace_late_bound_regions_with_fresh_var(call_expr.span, infer::FnCall, &fn_sig)
                 .0;
         let fn_sig = self.normalize_associated_types_in(call_expr.span, &fn_sig);
 
         // Call the generic checker.
         let expected_arg_tys =
-            self.expected_types_for_fn_args(call_expr.span,
+            self.expected_inputs_for_expected_output(call_expr.span,
                                             expected,
-                                            fn_sig.output,
-                                            &fn_sig.inputs);
+                                            fn_sig.output(),
+                                            fn_sig.inputs());
         self.check_argument_types(call_expr.span,
-                                  &fn_sig.inputs,
+                                  fn_sig.inputs(),
                                   &expected_arg_tys[..],
                                   arg_exprs,
                                   fn_sig.variadic,
-                                  TupleArgumentsFlag::DontTupleArguments);
+                                  TupleArgumentsFlag::DontTupleArguments,
+                                  def_span);
 
-        fn_sig.output
+        fn_sig.output()
     }
 
     fn confirm_deferred_closure_call(&self,
                                      call_expr: &hir::Expr,
-                                     arg_exprs: &'gcx [P<hir::Expr>],
+                                     arg_exprs: &'gcx [hir::Expr],
                                      expected: Expectation<'tcx>,
                                      fn_sig: ty::FnSig<'tcx>)
                                      -> Ty<'tcx> {
@@ -267,25 +283,26 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         // do know the types expected for each argument and the return
         // type.
 
-        let expected_arg_tys = self.expected_types_for_fn_args(call_expr.span,
+        let expected_arg_tys = self.expected_inputs_for_expected_output(call_expr.span,
                                                                expected,
-                                                               fn_sig.output.clone(),
-                                                               &fn_sig.inputs);
+                                                               fn_sig.output().clone(),
+                                                               fn_sig.inputs());
 
         self.check_argument_types(call_expr.span,
-                                  &fn_sig.inputs,
+                                  fn_sig.inputs(),
                                   &expected_arg_tys,
                                   arg_exprs,
                                   fn_sig.variadic,
-                                  TupleArgumentsFlag::TupleArguments);
+                                  TupleArgumentsFlag::TupleArguments,
+                                  None);
 
-        fn_sig.output
+        fn_sig.output()
     }
 
     fn confirm_overloaded_call(&self,
                                call_expr: &hir::Expr,
                                callee_expr: &'gcx hir::Expr,
-                               arg_exprs: &'gcx [P<hir::Expr>],
+                               arg_exprs: &'gcx [hir::Expr],
                                expected: Expectation<'tcx>,
                                method_callee: ty::MethodCallee<'tcx>)
                                -> Ty<'tcx> {
@@ -341,17 +358,17 @@ impl<'gcx, 'tcx> DeferredCallResolution<'gcx, 'tcx> for CallResolution<'gcx, 'tc
                 // (This always bites me, should find a way to
                 // refactor it.)
                 let method_sig = fcx.tcx
-                    .no_late_bound_regions(method_callee.ty.fn_sig())
+                    .no_late_bound_regions(&method_callee.ty.fn_sig())
                     .unwrap();
 
                 debug!("attempt_resolution: method_callee={:?}", method_callee);
 
-                for (&method_arg_ty, &self_arg_ty) in
-                    method_sig.inputs[1..].iter().zip(&self.fn_sig.inputs) {
-                    fcx.demand_eqtype(self.call_expr.span, self_arg_ty, method_arg_ty);
+                for (method_arg_ty, self_arg_ty) in
+                    method_sig.inputs().iter().skip(1).zip(self.fn_sig.inputs()) {
+                    fcx.demand_eqtype(self.call_expr.span, &self_arg_ty, &method_arg_ty);
                 }
 
-                fcx.demand_eqtype(self.call_expr.span, method_sig.output, self.fn_sig.output);
+                fcx.demand_eqtype(self.call_expr.span, method_sig.output(), self.fn_sig.output());
 
                 fcx.write_overloaded_call_method_map(self.call_expr, method_callee);
             }

@@ -15,32 +15,33 @@ use rustc::infer::{self, InferCtxt, InferOk};
 use rustc::traits::{self, Reveal};
 use rustc::ty::fold::TypeFoldable;
 use rustc::ty::{self, Ty, TyCtxt, TypeVariants};
-use rustc::mir::repr::*;
+use rustc::middle::const_val::ConstVal;
+use rustc::mir::*;
 use rustc::mir::tcx::LvalueTy;
-use rustc::mir::transform::{MirPass, MirSource, Pass};
-use rustc::mir::visit::{self, Visitor};
+use rustc::mir::transform::{MirPass, MirSource};
+use rustc::mir::visit::Visitor;
 use std::fmt;
 use syntax::ast;
 use syntax_pos::{Span, DUMMY_SP};
 
+use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::indexed_vec::Idx;
+
+fn mirbug(tcx: TyCtxt, span: Span, msg: &str) {
+    tcx.sess.diagnostic().span_bug(span, msg);
+}
 
 macro_rules! span_mirbug {
     ($context:expr, $elem:expr, $($message:tt)*) => ({
-        $context.tcx().sess.span_warn(
-            $context.last_span,
-            &format!("broken MIR ({:?}): {}", $elem, format!($($message)*))
-        )
+        mirbug($context.tcx(), $context.last_span,
+               &format!("broken MIR ({:?}): {}", $elem, format!($($message)*)))
     })
 }
 
 macro_rules! span_mirbug_and_err {
     ($context:expr, $elem:expr, $($message:tt)*) => ({
         {
-            $context.tcx().sess.span_warn(
-                $context.last_span,
-                &format!("broken MIR ({:?}): {:?}", $elem, format!($($message)*))
-            );
+            span_mirbug!($context, $elem, $($message)*);
             $context.error()
         }
     })
@@ -83,9 +84,13 @@ impl<'a, 'b, 'gcx, 'tcx> Visitor<'tcx> for TypeVerifier<'a, 'b, 'gcx, 'tcx> {
 
     fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
         self.super_rvalue(rvalue, location);
-        if let Some(ty) = rvalue.ty(self.mir, self.tcx()) {
-            self.sanitize_type(rvalue, ty);
-        }
+        let rval_ty = rvalue.ty(self.mir, self.tcx());
+        self.sanitize_type(rvalue, rval_ty);
+    }
+
+    fn visit_local_decl(&mut self, local_decl: &LocalDecl<'tcx>) {
+        self.super_local_decl(local_decl);
+        self.sanitize_type(local_decl, local_decl.ty);
     }
 
     fn visit_mir(&mut self, mir: &Mir<'tcx>) {
@@ -126,8 +131,18 @@ impl<'a, 'b, 'gcx, 'tcx> TypeVerifier<'a, 'b, 'gcx, 'tcx> {
         debug!("sanitize_lvalue: {:?}", lvalue);
         match *lvalue {
             Lvalue::Local(index) => LvalueTy::Ty { ty: self.mir.local_decls[index].ty },
-            Lvalue::Static(def_id) =>
-                LvalueTy::Ty { ty: self.tcx().lookup_item_type(def_id).ty },
+            Lvalue::Static(box Static { def_id, ty: sty }) => {
+                let sty = self.sanitize_type(lvalue, sty);
+                let ty = self.tcx().type_of(def_id);
+                let ty = self.cx.normalize(&ty);
+                if let Err(terr) = self.cx.eq_types(self.last_span, ty, sty) {
+                    span_mirbug!(
+                        self, lvalue, "bad static type ({:?}: {:?}): {:?}",
+                        ty, sty, terr);
+                }
+                LvalueTy::Ty { ty: sty }
+
+            },
             Lvalue::Projection(ref proj) => {
                 let base_ty = self.sanitize_lvalue(&proj.base, location);
                 if let LvalueTy::Ty { ty } = base_ty {
@@ -274,9 +289,15 @@ impl<'a, 'b, 'gcx, 'tcx> TypeVerifier<'a, 'b, 'gcx, 'tcx> {
                 ty::TyAdt(adt_def, substs) if adt_def.is_univariant() => {
                         (&adt_def.variants[0], substs)
                     }
-                ty::TyTuple(tys) | ty::TyClosure(_, ty::ClosureSubsts {
-                    upvar_tys: tys, ..
-                }) => {
+                ty::TyClosure(def_id, substs) => {
+                    return match substs.upvar_tys(def_id, tcx).nth(field.index()) {
+                        Some(ty) => Ok(ty),
+                        None => Err(FieldAccessError::OutOfRange {
+                            field_count: substs.upvar_tys(def_id, tcx).count()
+                        })
+                    }
+                }
+                ty::TyTuple(tys, _) => {
                     return match tys.get(field.index()) {
                         Some(&ty) => Ok(ty),
                         None => Err(FieldAccessError::OutOfRange {
@@ -300,32 +321,45 @@ impl<'a, 'b, 'gcx, 'tcx> TypeVerifier<'a, 'b, 'gcx, 'tcx> {
 pub struct TypeChecker<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
     infcx: &'a InferCtxt<'a, 'gcx, 'tcx>,
     fulfillment_cx: traits::FulfillmentContext<'tcx>,
-    last_span: Span
+    last_span: Span,
+    body_id: ast::NodeId,
+    reported_errors: FxHashSet<(Ty<'tcx>, Span)>,
 }
 
 impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
-    fn new(infcx: &'a InferCtxt<'a, 'gcx, 'tcx>) -> Self {
+    fn new(infcx: &'a InferCtxt<'a, 'gcx, 'tcx>, body_id: ast::NodeId) -> Self {
         TypeChecker {
             infcx: infcx,
             fulfillment_cx: traits::FulfillmentContext::new(),
-            last_span: DUMMY_SP
+            last_span: DUMMY_SP,
+            body_id: body_id,
+            reported_errors: FxHashSet(),
         }
     }
 
-    fn sub_types(&self, span: Span, sup: Ty<'tcx>, sub: Ty<'tcx>)
-                 -> infer::UnitResult<'tcx>
-    {
-        self.infcx.sub_types(false, infer::TypeOrigin::Misc(span), sup, sub)
-            // FIXME(#32730) propagate obligations
-            .map(|InferOk { obligations, .. }| assert!(obligations.is_empty()))
+    fn misc(&self, span: Span) -> traits::ObligationCause<'tcx> {
+        traits::ObligationCause::misc(span, self.body_id)
     }
 
-    fn eq_types(&self, span: Span, a: Ty<'tcx>, b: Ty<'tcx>)
+    pub fn register_infer_ok_obligations<T>(&mut self, infer_ok: InferOk<'tcx, T>) -> T {
+        for obligation in infer_ok.obligations {
+            self.fulfillment_cx.register_predicate_obligation(self.infcx, obligation);
+        }
+        infer_ok.value
+    }
+
+    fn sub_types(&mut self, sup: Ty<'tcx>, sub: Ty<'tcx>)
+                 -> infer::UnitResult<'tcx>
+    {
+        self.infcx.sub_types(false, &self.misc(self.last_span), sup, sub)
+            .map(|ok| self.register_infer_ok_obligations(ok))
+    }
+
+    fn eq_types(&mut self, span: Span, a: Ty<'tcx>, b: Ty<'tcx>)
                 -> infer::UnitResult<'tcx>
     {
-        self.infcx.eq_types(false, infer::TypeOrigin::Misc(span), a, b)
-            // FIXME(#32730) propagate obligations
-            .map(|InferOk { obligations, .. }| assert!(obligations.is_empty()))
+        self.infcx.eq_types(false, &self.misc(span), a, b)
+            .map(|ok| self.register_infer_ok_obligations(ok))
     }
 
     fn tcx(&self) -> TyCtxt<'a, 'gcx, 'tcx> {
@@ -339,13 +373,9 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
             StatementKind::Assign(ref lv, ref rv) => {
                 let lv_ty = lv.ty(mir, tcx).to_ty(tcx);
                 let rv_ty = rv.ty(mir, tcx);
-                if let Some(rv_ty) = rv_ty {
-                    if let Err(terr) = self.sub_types(self.last_span, rv_ty, lv_ty) {
-                        span_mirbug!(self, stmt, "bad assignment ({:?} = {:?}): {:?}",
-                                     lv_ty, rv_ty, terr);
-                    }
-                // FIXME: rvalue with undeterminable type - e.g. inline
-                // asm.
+                if let Err(terr) = self.sub_types(rv_ty, lv_ty) {
+                    span_mirbug!(self, stmt, "bad assignment ({:?} = {:?}): {:?}",
+                                 lv_ty, rv_ty, terr);
                 }
             }
             StatementKind::SetDiscriminant{ ref lvalue, variant_index } => {
@@ -375,6 +405,7 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
                     }
                 }
             }
+            StatementKind::InlineAsm { .. } |
             StatementKind::Nop => {}
         }
     }
@@ -401,24 +432,14 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
             } => {
                 let lv_ty = location.ty(mir, tcx).to_ty(tcx);
                 let rv_ty = value.ty(mir, tcx);
-                if let Err(terr) = self.sub_types(self.last_span, rv_ty, lv_ty) {
+                if let Err(terr) = self.sub_types(rv_ty, lv_ty) {
                     span_mirbug!(self, term, "bad DropAndReplace ({:?} = {:?}): {:?}",
                                  lv_ty, rv_ty, terr);
                 }
             }
-
-            TerminatorKind::If { ref cond, .. } => {
-                let cond_ty = cond.ty(mir, tcx);
-                match cond_ty.sty {
-                    ty::TyBool => {}
-                    _ => {
-                        span_mirbug!(self, term, "bad If ({:?}, not bool", cond_ty);
-                    }
-                }
-            }
             TerminatorKind::SwitchInt { ref discr, switch_ty, .. } => {
-                let discr_ty = discr.ty(mir, tcx).to_ty(tcx);
-                if let Err(terr) = self.sub_types(self.last_span, discr_ty, switch_ty) {
+                let discr_ty = discr.ty(mir, tcx);
+                if let Err(terr) = self.sub_types(discr_ty, switch_ty) {
                     span_mirbug!(self, term, "bad SwitchInt ({:?} on {:?}): {:?}",
                                  switch_ty, discr_ty, terr);
                 }
@@ -429,30 +450,17 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
                 }
                 // FIXME: check the values
             }
-            TerminatorKind::Switch { ref discr, adt_def, ref targets } => {
-                let discr_ty = discr.ty(mir, tcx).to_ty(tcx);
-                match discr_ty.sty {
-                    ty::TyAdt(def, _) if def.is_enum() &&
-                                         def == adt_def &&
-                                         adt_def.variants.len() == targets.len()
-                      => {},
-                    _ => {
-                        span_mirbug!(self, term, "bad Switch ({:?} on {:?})",
-                                     adt_def, discr_ty);
-                    }
-                }
-            }
             TerminatorKind::Call { ref func, ref args, ref destination, .. } => {
                 let func_ty = func.ty(mir, tcx);
                 debug!("check_terminator: call, func_ty={:?}", func_ty);
-                let func_ty = match func_ty.sty {
-                    ty::TyFnDef(.., func_ty) | ty::TyFnPtr(func_ty) => func_ty,
+                let sig = match func_ty.sty {
+                    ty::TyFnDef(.., sig) | ty::TyFnPtr(sig) => sig,
                     _ => {
                         span_mirbug!(self, term, "call to non-function {:?}", func_ty);
                         return;
                     }
                 };
-                let sig = tcx.erase_late_bound_regions(&func_ty.sig);
+                let sig = tcx.erase_late_bound_regions(&sig);
                 let sig = self.normalize(&sig);
                 self.check_call_dest(mir, term, &sig, destination);
 
@@ -480,7 +488,7 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
         }
     }
 
-    fn check_call_dest(&self,
+    fn check_call_dest(&mut self,
                        mir: &Mir<'tcx>,
                        term: &Terminator<'tcx>,
                        sig: &ty::FnSig<'tcx>,
@@ -489,35 +497,35 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
         match *destination {
             Some((ref dest, _)) => {
                 let dest_ty = dest.ty(mir, tcx).to_ty(tcx);
-                if let Err(terr) = self.sub_types(self.last_span, sig.output, dest_ty) {
+                if let Err(terr) = self.sub_types(sig.output(), dest_ty) {
                     span_mirbug!(self, term,
                                  "call dest mismatch ({:?} <- {:?}): {:?}",
-                                 dest_ty, sig.output, terr);
+                                 dest_ty, sig.output(), terr);
                 }
             },
             None => {
                 // FIXME(canndrew): This is_never should probably be an is_uninhabited
-                if !sig.output.is_never() {
+                if !sig.output().is_never() {
                     span_mirbug!(self, term, "call to converging function {:?} w/o dest", sig);
                 }
             },
         }
     }
 
-    fn check_call_inputs(&self,
+    fn check_call_inputs(&mut self,
                          mir: &Mir<'tcx>,
                          term: &Terminator<'tcx>,
                          sig: &ty::FnSig<'tcx>,
                          args: &[Operand<'tcx>])
     {
         debug!("check_call_inputs({:?}, {:?})", sig, args);
-        if args.len() < sig.inputs.len() ||
-           (args.len() > sig.inputs.len() && !sig.variadic) {
+        if args.len() < sig.inputs().len() ||
+           (args.len() > sig.inputs().len() && !sig.variadic) {
             span_mirbug!(self, term, "call to {:?} with wrong # of args", sig);
         }
-        for (n, (fn_arg, op_arg)) in sig.inputs.iter().zip(args).enumerate() {
+        for (n, (fn_arg, op_arg)) in sig.inputs().iter().zip(args).enumerate() {
             let op_arg_ty = op_arg.ty(mir, self.tcx());
-            if let Err(terr) = self.sub_types(self.last_span, op_arg_ty, fn_arg) {
+            if let Err(terr) = self.sub_types(op_arg_ty, fn_arg) {
                 span_mirbug!(self, term, "bad arg #{:?} ({:?} <- {:?}): {:?}",
                              n, fn_arg, op_arg_ty, terr);
             }
@@ -526,8 +534,10 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
 
     fn is_box_free(&self, operand: &Operand<'tcx>) -> bool {
         match operand {
-            &Operand::Constant(Constant {
-                literal: Literal::Item { def_id, .. }, ..
+            &Operand::Constant(box Constant {
+                literal: Literal::Value {
+                    value: ConstVal::Function(def_id, _), ..
+                }, ..
             }) => {
                 Some(def_id) == self.tcx().lang_items.box_free_fn()
             }
@@ -535,7 +545,7 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
         }
     }
 
-    fn check_box_free_inputs(&self,
+    fn check_box_free_inputs(&mut self,
                              mir: &Mir<'tcx>,
                              term: &Terminator<'tcx>,
                              sig: &ty::FnSig<'tcx>,
@@ -545,12 +555,12 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
 
         // box_free takes a Box as a pointer. Allow for that.
 
-        if sig.inputs.len() != 1 {
+        if sig.inputs().len() != 1 {
             span_mirbug!(self, term, "box_free should take 1 argument");
             return;
         }
 
-        let pointee_ty = match sig.inputs[0].sty {
+        let pointee_ty = match sig.inputs()[0].sty {
             ty::TyRawPtr(mt) => mt.ty,
             _ => {
                 span_mirbug!(self, term, "box_free should take a raw ptr");
@@ -563,16 +573,17 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
             return;
         }
 
-        let arg_ty = match args[0].ty(mir, self.tcx()).sty {
+        let ty = args[0].ty(mir, self.tcx());
+        let arg_ty = match ty.sty {
             ty::TyRawPtr(mt) => mt.ty,
-            ty::TyBox(ty) => ty,
+            ty::TyAdt(def, _) if def.is_box() => ty.boxed_ty(),
             _ => {
                 span_mirbug!(self, term, "box_free called with bad arg ty");
                 return;
             }
         };
 
-        if let Err(terr) = self.sub_types(self.last_span, arg_ty, pointee_ty) {
+        if let Err(terr) = self.sub_types(arg_ty, pointee_ty) {
             span_mirbug!(self, term, "bad box_free arg ({:?} <- {:?}): {:?}",
                          pointee_ty, arg_ty, terr);
         }
@@ -585,11 +596,6 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
         match block.terminator().kind {
             TerminatorKind::Goto { target } =>
                 self.assert_iscleanup(mir, block, target, is_cleanup),
-            TerminatorKind::If { targets: (on_true, on_false), .. } => {
-                self.assert_iscleanup(mir, block, on_true, is_cleanup);
-                self.assert_iscleanup(mir, block, on_false, is_cleanup);
-            }
-            TerminatorKind::Switch { ref targets, .. } |
             TerminatorKind::SwitchInt { ref targets, .. } => {
                 for target in targets {
                     self.assert_iscleanup(mir, block, *target, is_cleanup);
@@ -643,9 +649,43 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
         }
     }
 
-    fn typeck_mir(&mut self, mir: &Mir<'tcx>) {
+    fn check_local(&mut self, mir: &Mir<'gcx>, local: Local, local_decl: &LocalDecl<'gcx>) {
+        match mir.local_kind(local) {
+            LocalKind::ReturnPointer | LocalKind::Arg => {
+                // return values of normal functions are required to be
+                // sized by typeck, but return values of ADT constructors are
+                // not because we don't include a `Self: Sized` bounds on them.
+                //
+                // Unbound parts of arguments were never required to be Sized
+                // - maybe we should make that a warning.
+                return
+            }
+            LocalKind::Var | LocalKind::Temp => {}
+        }
+
+        let span = local_decl.source_info.span;
+        let ty = local_decl.ty;
+        if !ty.is_sized(self.tcx().global_tcx(), self.infcx.param_env(), span) {
+            // in current MIR construction, all non-control-flow rvalue
+            // expressions evaluate through `as_temp` or `into` a return
+            // slot or local, so to find all unsized rvalues it is enough
+            // to check all temps, return slots and locals.
+            if let None = self.reported_errors.replace((ty, span)) {
+                span_err!(self.tcx().sess, span, E0161,
+                          "cannot move a value of type {0}: the size of {0} \
+                           cannot be statically determined", ty);
+            }
+        }
+    }
+
+    fn typeck_mir(&mut self, mir: &Mir<'gcx>) {
         self.last_span = mir.span;
         debug!("run_on_mir: {:?}", mir.span);
+
+        for (local, local_decl) in mir.local_decls.iter_enumerated() {
+            self.check_local(mir, local, local_decl);
+        }
+
         for block in mir.basic_blocks() {
             for stmt in &block.statements {
                 if stmt.source_info.span != DUMMY_SP {
@@ -697,19 +737,23 @@ impl TypeckMir {
     }
 }
 
-impl<'tcx> MirPass<'tcx> for TypeckMir {
-    fn run_pass<'a>(&mut self, tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                    src: MirSource, mir: &mut Mir<'tcx>) {
-        debug!("run_pass: {}", tcx.node_path_str(src.item_id()));
+impl MirPass for TypeckMir {
+    fn run_pass<'a, 'tcx>(&self,
+                          tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                          src: MirSource,
+                          mir: &mut Mir<'tcx>) {
+        let item_id = src.item_id();
+        let def_id = tcx.hir.local_def_id(item_id);
+        debug!("run_pass: {:?}", def_id);
 
         if tcx.sess.err_count() > 0 {
             // compiling a broken program can obviously result in a
             // broken MIR, so try not to report duplicate errors.
             return;
         }
-        let param_env = ty::ParameterEnvironment::for_item(tcx, src.item_id());
-        tcx.infer_ctxt(None, Some(param_env), Reveal::NotSpecializable).enter(|infcx| {
-            let mut checker = TypeChecker::new(&infcx);
+        let param_env = tcx.param_env(def_id);
+        tcx.infer_ctxt(param_env, Reveal::UserFacing).enter(|infcx| {
+            let mut checker = TypeChecker::new(&infcx, item_id);
             {
                 let mut verifier = TypeVerifier::new(&mut checker, mir);
                 verifier.visit_mir(mir);
@@ -722,7 +766,4 @@ impl<'tcx> MirPass<'tcx> for TypeckMir {
             checker.verify_obligations(mir);
         });
     }
-}
-
-impl Pass for TypeckMir {
 }

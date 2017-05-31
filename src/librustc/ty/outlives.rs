@@ -12,12 +12,11 @@
 // refers to rules defined in RFC 1214 (`OutlivesFooBar`), so see that
 // RFC for reference.
 
-use infer::InferCtxt;
-use ty::{self, Ty, TypeFoldable};
+use ty::{self, Ty, TyCtxt, TypeFoldable};
 
 #[derive(Debug)]
 pub enum Component<'tcx> {
-    Region(&'tcx ty::Region),
+    Region(ty::Region<'tcx>),
     Param(ty::ParamTy),
     UnresolvedInferenceVariable(ty::InferTy),
 
@@ -55,9 +54,9 @@ pub enum Component<'tcx> {
     EscapingProjection(Vec<Component<'tcx>>),
 }
 
-impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
+impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     /// Returns all the things that must outlive `'a` for the condition
-    /// `ty0: 'a` to hold.
+    /// `ty0: 'a` to hold. Note that `ty0` must be a **fully resolved type**.
     pub fn outlives_components(&self, ty0: Ty<'tcx>)
                                -> Vec<Component<'tcx>> {
         let mut components = vec![];
@@ -73,7 +72,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         // in the `subtys` iterator (e.g., when encountering a
         // projection).
         match ty.sty {
-            ty::TyClosure(_, ref substs) => {
+            ty::TyClosure(def_id, ref substs) => {
                 // FIXME(#27086). We do not accumulate from substs, since they
                 // don't represent reachable data. This means that, in
                 // practice, some of the lifetime parameters might not
@@ -111,7 +110,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                 // what func/type parameters are used and unused,
                 // taking into consideration UFCS and so forth.
 
-                for &upvar_ty in substs.upvar_tys {
+                for upvar_ty in substs.upvar_tys(def_id, *self) {
                     self.compute_components(upvar_ty, out);
                 }
             }
@@ -148,16 +147,11 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                 }
             }
 
-            // If we encounter an inference variable, try to resolve it
-            // and proceed with resolved version. If we cannot resolve it,
-            // then record the unresolved variable as a component.
-            ty::TyInfer(_) => {
-                let ty = self.resolve_type_vars_if_possible(&ty);
-                if let ty::TyInfer(infer_ty) = ty.sty {
-                    out.push(Component::UnresolvedInferenceVariable(infer_ty));
-                } else {
-                    self.compute_components(ty, out);
-                }
+            // We assume that inference variables are fully resolved.
+            // So, if we encounter an inference variable, just record
+            // the unresolved variable as a component.
+            ty::TyInfer(infer_ty) => {
+                out.push(Component::UnresolvedInferenceVariable(infer_ty));
             }
 
             // Most types do not introduce any region binders, nor
@@ -173,7 +167,6 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
             ty::TyFloat(..) |       // OutlivesScalar
             ty::TyNever |           // ...
             ty::TyAdt(..) |         // OutlivesNominalType
-            ty::TyBox(..) |         // OutlivesNominalType (ish)
             ty::TyAnon(..) |        // OutlivesNominalType (ish)
             ty::TyStr |             // OutlivesScalar (ish)
             ty::TyArray(..) |       // ...
@@ -183,7 +176,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
             ty::TyTuple(..) |       // ...
             ty::TyFnDef(..) |       // OutlivesFunction (*)
             ty::TyFnPtr(_) |        // OutlivesFunction (*)
-            ty::TyTrait(..) |       // OutlivesObject, OutlivesFragment (*)
+            ty::TyDynamic(..) |       // OutlivesObject, OutlivesFragment (*)
             ty::TyError => {
                 // (*) Bare functions and traits are both binders. In the
                 // RFC, this means we would add the bound regions to the
@@ -209,9 +202,9 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
     }
 }
 
-fn push_region_constraints<'tcx>(out: &mut Vec<Component<'tcx>>, regions: Vec<&'tcx ty::Region>) {
+fn push_region_constraints<'tcx>(out: &mut Vec<Component<'tcx>>, regions: Vec<ty::Region<'tcx>>) {
     for r in regions {
-        if !r.is_bound() {
+        if !r.is_late_bound() {
             out.push(Component::Region(r));
         }
     }

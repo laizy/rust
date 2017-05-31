@@ -9,9 +9,9 @@
 // except according to those terms.
 
 
-use rustc::ty::{self, TyCtxt, ParameterEnvironment};
-use rustc::mir::repr::*;
-use rustc::util::nodemap::FnvHashMap;
+use rustc::ty::{self, TyCtxt};
+use rustc::mir::*;
+use rustc::util::nodemap::FxHashMap;
 use rustc_data_structures::indexed_vec::{IndexVec};
 
 use syntax::codemap::DUMMY_SP;
@@ -43,7 +43,7 @@ mod indexes {
                     unsafe { $Index(NonZero::new(idx + 1)) }
                 }
                 fn index(self) -> usize {
-                    *self.0 - 1
+                    self.0.get() - 1
                 }
             }
 
@@ -120,6 +120,10 @@ pub struct MoveData<'tcx> {
     pub rev_lookup: MovePathLookup<'tcx>,
 }
 
+pub trait HasMoveData<'tcx> {
+    fn move_data(&self) -> &MoveData<'tcx>;
+}
+
 #[derive(Debug)]
 pub struct LocationMap<T> {
     /// Location-indexed (BasicBlock for outer index, index within BB
@@ -181,13 +185,13 @@ pub struct MovePathLookup<'tcx> {
     /// subsequent search so that it is solely relative to that
     /// base-lvalue). For the remaining lookup, we map the projection
     /// elem to the associated MovePathIndex.
-    projections: FnvHashMap<(MovePathIndex, AbstractElem<'tcx>), MovePathIndex>
+    projections: FxHashMap<(MovePathIndex, AbstractElem<'tcx>), MovePathIndex>
 }
 
 struct MoveDataBuilder<'a, 'tcx: 'a> {
     mir: &'a Mir<'tcx>,
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
-    param_env: &'a ParameterEnvironment<'tcx>,
+    param_env: ty::ParamEnv<'tcx>,
     data: MoveData<'tcx>,
 }
 
@@ -199,7 +203,7 @@ pub enum MovePathError {
 impl<'a, 'tcx> MoveDataBuilder<'a, 'tcx> {
     fn new(mir: &'a Mir<'tcx>,
            tcx: TyCtxt<'a, 'tcx, 'tcx>,
-           param_env: &'a ParameterEnvironment<'tcx>)
+           param_env: ty::ParamEnv<'tcx>)
            -> Self {
         let mut move_paths = IndexVec::new();
         let mut path_map = IndexVec::new();
@@ -215,7 +219,7 @@ impl<'a, 'tcx> MoveDataBuilder<'a, 'tcx> {
                     locals: mir.local_decls.indices().map(Lvalue::Local).map(|v| {
                         Self::new_move_path(&mut move_paths, &mut path_map, None, v)
                     }).collect(),
-                    projections: FnvHashMap(),
+                    projections: FxHashMap(),
                 },
                 move_paths: move_paths,
                 path_map: path_map,
@@ -285,7 +289,7 @@ impl<'a, 'tcx> MoveDataBuilder<'a, 'tcx> {
             // error: can't move out of borrowed content
             ty::TyRef(..) | ty::TyRawPtr(..) => return Err(MovePathError::IllegalMove),
             // error: can't move out of struct with destructor
-            ty::TyAdt(adt, _) if adt.has_dtor() =>
+            ty::TyAdt(adt, _) if adt.has_dtor(self.tcx) && !adt.is_box() =>
                 return Err(MovePathError::IllegalMove),
             // move out of union - always move the entire union
             ty::TyAdt(adt, _) if adt.is_union() =>
@@ -366,7 +370,7 @@ impl<'tcx> MovePathLookup<'tcx> {
 impl<'a, 'tcx> MoveData<'tcx> {
     pub fn gather_moves(mir: &Mir<'tcx>,
                         tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                        param_env: &ParameterEnvironment<'tcx>)
+                        param_env: ty::ParamEnv<'tcx>)
                         -> Self {
         gather_moves(mir, tcx, param_env)
     }
@@ -374,7 +378,7 @@ impl<'a, 'tcx> MoveData<'tcx> {
 
 fn gather_moves<'a, 'tcx>(mir: &Mir<'tcx>,
                           tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                          param_env: &ParameterEnvironment<'tcx>)
+                          param_env: ty::ParamEnv<'tcx>)
                           -> MoveData<'tcx> {
     let mut builder = MoveDataBuilder::new(mir, tcx, param_env);
 
@@ -408,6 +412,7 @@ impl<'a, 'tcx> MoveDataBuilder<'a, 'tcx> {
                 span_bug!(stmt.source_info.span,
                           "SetDiscriminant should not exist during borrowck");
             }
+            StatementKind::InlineAsm { .. } |
             StatementKind::Nop => {}
         }
     }
@@ -431,9 +436,10 @@ impl<'a, 'tcx> MoveDataBuilder<'a, 'tcx> {
                 }
             }
             Rvalue::Ref(..) |
+            Rvalue::Discriminant(..) |
             Rvalue::Len(..) |
-            Rvalue::InlineAsm { .. } => {}
-            Rvalue::Box(..) => {
+            Rvalue::NullaryOp(NullOp::SizeOf, _) |
+            Rvalue::NullaryOp(NullOp::Box, _) => {
                 // This returns an rvalue with uninitialized contents. We can't
                 // move out of it here because it is an rvalue - assignments always
                 // completely initialize their lvalue.
@@ -459,10 +465,8 @@ impl<'a, 'tcx> MoveDataBuilder<'a, 'tcx> {
                 self.gather_move(loc, &Lvalue::Local(RETURN_POINTER));
             }
 
-            TerminatorKind::If { .. } |
             TerminatorKind::Assert { .. } |
-            TerminatorKind::SwitchInt { .. } |
-            TerminatorKind::Switch { .. } => {
+            TerminatorKind::SwitchInt { .. } => {
                 // branching terminators - these don't move anything
             }
 

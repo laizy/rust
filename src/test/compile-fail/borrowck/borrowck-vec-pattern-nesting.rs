@@ -25,7 +25,7 @@ fn a() {
 }
 
 fn b() {
-    let mut vec = vec!(box 1, box 2, box 3);
+    let mut vec = vec![box 1, box 2, box 3];
     let vec: &mut [Box<isize>] = &mut vec;
     match vec {
         &mut [ref _b..] => {
@@ -37,7 +37,7 @@ fn b() {
 }
 
 fn c() {
-    let mut vec = vec!(box 1, box 2, box 3);
+    let mut vec = vec![box 1, box 2, box 3];
     let vec: &mut [Box<isize>] = &mut vec;
     match vec {
         &mut [_a, //~ ERROR cannot move out
@@ -54,12 +54,11 @@ fn c() {
         _ => {}
     }
     let a = vec[0]; //~ ERROR cannot move out
-    //~^ NOTE to prevent move
     //~| cannot move out of here
 }
 
 fn d() {
-    let mut vec = vec!(box 1, box 2, box 3);
+    let mut vec = vec![box 1, box 2, box 3];
     let vec: &mut [Box<isize>] = &mut vec;
     match vec {
         &mut [ //~ ERROR cannot move out
@@ -68,12 +67,11 @@ fn d() {
         _ => {}
     }
     let a = vec[0]; //~ ERROR cannot move out
-    //~^ NOTE to prevent move
     //~| cannot move out of here
 }
 
 fn e() {
-    let mut vec = vec!(box 1, box 2, box 3);
+    let mut vec = vec![box 1, box 2, box 3];
     let vec: &mut [Box<isize>] = &mut vec;
     match vec {
         &mut [_a, _b, _c] => {}  //~ ERROR cannot move out
@@ -84,7 +82,6 @@ fn e() {
         _ => {}
     }
     let a = vec[0]; //~ ERROR cannot move out
-    //~^ NOTE to prevent move
     //~| cannot move out of here
 }
 

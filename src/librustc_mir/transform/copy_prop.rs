@@ -29,22 +29,20 @@
 //! (non-mutating) use of `SRC`. These restrictions are conservative and may be relaxed in the
 //! future.
 
-use def_use::DefUseAnalysis;
-use rustc::mir::repr::{Constant, Local, Location, Lvalue, Mir, Operand, Rvalue, StatementKind};
-use rustc::mir::transform::{MirPass, MirSource, Pass};
+use rustc::mir::{Constant, Local, LocalKind, Location, Lvalue, Mir, Operand, Rvalue, StatementKind};
+use rustc::mir::transform::{MirPass, MirSource};
 use rustc::mir::visit::MutVisitor;
 use rustc::ty::TyCtxt;
+use util::def_use::DefUseAnalysis;
 use transform::qualify_consts;
 
 pub struct CopyPropagation;
 
-impl Pass for CopyPropagation {}
-
-impl<'tcx> MirPass<'tcx> for CopyPropagation {
-    fn run_pass<'a>(&mut self,
-                    tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                    source: MirSource,
-                    mir: &mut Mir<'tcx>) {
+impl MirPass for CopyPropagation {
+    fn run_pass<'a, 'tcx>(&self,
+                          tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                          source: MirSource,
+                          mir: &mut Mir<'tcx>) {
         match source {
             MirSource::Const(_) => {
                 // Don't run on constants, because constant qualification might reject the
@@ -57,7 +55,7 @@ impl<'tcx> MirPass<'tcx> for CopyPropagation {
                 return
             }
             MirSource::Fn(function_node_id) => {
-                if qualify_consts::is_const_fn(tcx, tcx.map.local_def_id(function_node_id)) {
+                if qualify_consts::is_const_fn(tcx, tcx.hir.local_def_id(function_node_id)) {
                     // Don't run on const functions, as, again, trans might not be able to evaluate
                     // the optimized IR.
                     return
@@ -65,11 +63,10 @@ impl<'tcx> MirPass<'tcx> for CopyPropagation {
             }
         }
 
-        // We only run when the MIR optimization level is at least 1. This avoids messing up debug
-        // info.
-        match tcx.sess.opts.debugging_opts.mir_opt_level {
-            Some(0) | None => return,
-            _ => {}
+        // We only run when the MIR optimization level is > 1.
+        // This avoids a slow pass, and messing up debug info.
+        if tcx.sess.opts.debugging_opts.mir_opt_level <= 1 {
+            return;
         }
 
         loop {
@@ -123,7 +120,7 @@ impl<'tcx> MirPass<'tcx> for CopyPropagation {
                                 local == dest_local => {
                             let maybe_action = match *operand {
                                 Operand::Consume(ref src_lvalue) => {
-                                    Action::local_copy(&def_use_analysis, src_lvalue)
+                                    Action::local_copy(&mir, &def_use_analysis, src_lvalue)
                                 }
                                 Operand::Constant(ref src_constant) => {
                                     Action::constant(src_constant)
@@ -160,7 +157,7 @@ enum Action<'tcx> {
 }
 
 impl<'tcx> Action<'tcx> {
-    fn local_copy(def_use_analysis: &DefUseAnalysis, src_lvalue: &Lvalue<'tcx>)
+    fn local_copy(mir: &Mir<'tcx>, def_use_analysis: &DefUseAnalysis, src_lvalue: &Lvalue<'tcx>)
                   -> Option<Action<'tcx>> {
         // The source must be a local.
         let src_local = if let Lvalue::Local(local) = *src_lvalue {
@@ -196,7 +193,9 @@ impl<'tcx> Action<'tcx> {
         //     SRC = X;
         //     USE(SRC);
         let src_def_count = src_use_info.def_count_not_including_drop();
-        if src_def_count != 1 {
+        // allow function arguments to be propagated
+        if src_def_count > 1 ||
+            (src_def_count == 0 && mir.local_kind(src_local) != LocalKind::Arg) {
             debug!("  Can't copy-propagate local: {} defs of src",
                    src_use_info.def_count_not_including_drop());
             return None
@@ -317,7 +316,7 @@ impl<'tcx> MutVisitor<'tcx> for ConstantPropagationVisitor<'tcx> {
             _ => return,
         }
 
-        *operand = Operand::Constant(self.constant.clone());
+        *operand = Operand::Constant(box self.constant.clone());
         self.uses_replaced += 1
     }
 }

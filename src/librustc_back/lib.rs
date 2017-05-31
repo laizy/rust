@@ -22,23 +22,22 @@
 //! build speedups.
 
 #![crate_name = "rustc_back"]
-#![unstable(feature = "rustc_private", issue = "27812")]
 #![crate_type = "dylib"]
 #![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![cfg_attr(not(stage0), deny(warnings))]
+#![deny(warnings)]
 
 #![feature(box_syntax)]
 #![feature(const_fn)]
 #![feature(libc)]
 #![feature(rand)]
-#![feature(rustc_private)]
-#![feature(staged_api)]
-#![feature(step_by)]
-#![cfg_attr(stage0, feature(question_mark))]
-#![cfg_attr(test, feature(test, rand))]
+#![cfg_attr(test, feature(rand))]
+
+#![cfg_attr(stage0, unstable(feature = "rustc_private", issue = "27812"))]
+#![cfg_attr(stage0, feature(rustc_private))]
+#![cfg_attr(stage0, feature(staged_api))]
 
 extern crate syntax;
 extern crate libc;
@@ -48,12 +47,53 @@ extern crate serialize;
 extern crate serialize as rustc_serialize; // used by deriving
 
 pub mod tempdir;
-pub mod sha2;
 pub mod target;
 pub mod slice;
 pub mod dynamic_lib;
 
 use serialize::json::{Json, ToJson};
+
+macro_rules! linker_flavor {
+    ($(($variant:ident, $string:expr),)+) => {
+        #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash,
+                 RustcEncodable, RustcDecodable)]
+        pub enum LinkerFlavor {
+            $($variant,)+
+        }
+
+        impl LinkerFlavor {
+            pub const fn one_of() -> &'static str {
+                concat!("one of: ", $($string, " ",)+)
+            }
+
+            pub fn from_str(s: &str) -> Option<Self> {
+                Some(match s {
+                    $($string => LinkerFlavor::$variant,)+
+                    _ => return None,
+                })
+            }
+
+            pub fn desc(&self) -> &str {
+                match *self {
+                    $(LinkerFlavor::$variant => $string,)+
+                }
+            }
+        }
+
+        impl ToJson for LinkerFlavor {
+            fn to_json(&self) -> Json {
+                self.desc().to_json()
+            }
+        }
+    }
+}
+
+linker_flavor! {
+    (Em, "em"),
+    (Gcc, "gcc"),
+    (Ld, "ld"),
+    (Msvc, "msvc"),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Hash, RustcEncodable, RustcDecodable)]
 pub enum PanicStrategy {

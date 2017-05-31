@@ -13,7 +13,6 @@ struct S<'a, T:'a> {
 }
 
 fn main() {
-    S { o: &None }; //~ ERROR unable to infer enough type information about `_` [E0282]
-                    //~| NOTE cannot infer type for `_`
-                    //~| NOTE type annotations or generic parameter binding
+    S { o: &None }; //~ ERROR type annotations needed [E0282]
+                    //~| NOTE cannot infer type for `T`
 }

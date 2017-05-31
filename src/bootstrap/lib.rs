@@ -13,50 +13,91 @@
 //! This module, and its descendants, are the implementation of the Rust build
 //! system. Most of this build system is backed by Cargo but the outer layer
 //! here serves as the ability to orchestrate calling Cargo, sequencing Cargo
-//! builds, building artifacts like LLVM, etc.
+//! builds, building artifacts like LLVM, etc. The goals of rustbuild are:
 //!
-//! More documentation can be found in each respective module below.
+//! * To be an easily understandable, easily extensible, and maintainable build
+//!   system.
+//! * Leverage standard tools in the Rust ecosystem to build the compiler, aka
+//!   crates.io and Cargo.
+//! * A standard interface to build across all platforms, including MSVC
+//!
+//! ## Architecture
+//!
+//! Although this build system defers most of the complicated logic to Cargo
+//! itself, it still needs to maintain a list of targets and dependencies which
+//! it can itself perform. Rustbuild is made up of a list of rules with
+//! dependencies amongst them (created in the `step` module) and then knows how
+//! to execute each in sequence. Each time rustbuild is invoked, it will simply
+//! iterate through this list of steps and execute each serially in turn.  For
+//! each step rustbuild relies on the step internally being incremental and
+//! parallel. Note, though, that the `-j` parameter to rustbuild gets forwarded
+//! to appropriate test harnesses and such.
+//!
+//! Most of the "meaty" steps that matter are backed by Cargo, which does indeed
+//! have its own parallelism and incremental management. Later steps, like
+//! tests, aren't incremental and simply run the entire suite currently.
+//!
+//! When you execute `x.py build`, the steps which are executed are:
+//!
+//! * First, the python script is run. This will automatically download the
+//!   stage0 rustc and cargo according to `src/stage0.txt`, or using the cached
+//!   versions if they're available. These are then used to compile rustbuild
+//!   itself (using Cargo). Finally, control is then transferred to rustbuild.
+//!
+//! * Rustbuild takes over, performs sanity checks, probes the environment,
+//!   reads configuration, builds up a list of steps, and then starts executing
+//!   them.
+//!
+//! * The stage0 libstd is compiled
+//! * The stage0 libtest is compiled
+//! * The stage0 librustc is compiled
+//! * The stage1 compiler is assembled
+//! * The stage1 libstd, libtest, librustc are compiled
+//! * The stage2 compiler is assembled
+//! * The stage2 libstd, libtest, librustc are compiled
+//!
+//! Each step is driven by a separate Cargo project and rustbuild orchestrates
+//! copying files between steps and otherwise preparing for Cargo to run.
+//!
+//! ## Further information
+//!
+//! More documentation can be found in each respective module below, and you can
+//! also check out the `src/bootstrap/README.md` file for more information.
 
+#![deny(warnings)]
+
+#[macro_use]
 extern crate build_helper;
 extern crate cmake;
 extern crate filetime;
 extern crate gcc;
 extern crate getopts;
-extern crate md5;
 extern crate num_cpus;
 extern crate rustc_serialize;
 extern crate toml;
 
+#[cfg(unix)]
+extern crate libc;
+
+use std::cmp;
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, File};
-use std::path::{Component, PathBuf, Path};
+use std::io::Read;
+use std::path::{PathBuf, Path};
 use std::process::Command;
 
-use build_helper::{run_silent, output};
+use build_helper::{run_silent, run_suppressed, output, mtime};
 
-use util::{exe, mtime, libdir, add_lib_path};
-
-/// A helper macro to `unwrap` a result except also print out details like:
-///
-/// * The file/line of the panic
-/// * The expression that failed
-/// * The error itself
-///
-/// This is currently used judiciously throughout the build system rather than
-/// using a `Result` with `try!`, but this may change one day...
-macro_rules! t {
-    ($e:expr) => (match $e {
-        Ok(e) => e,
-        Err(e) => panic!("{} failed with {}", stringify!($e), e),
-    })
-}
+use util::{exe, libdir, add_lib_path};
 
 mod cc;
 mod channel;
 mod check;
 mod clean;
 mod compile;
+mod metadata;
 mod config;
 mod dist;
 mod doc;
@@ -70,13 +111,25 @@ pub mod util;
 #[cfg(windows)]
 mod job;
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 mod job {
-    pub unsafe fn setup() {}
+    use libc;
+
+    pub unsafe fn setup(build: &mut ::Build) {
+        if build.config.low_priority {
+            libc::setpriority(libc::PRIO_PGRP as _, 0, 10);
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+mod job {
+    pub unsafe fn setup(_build: &mut ::Build) {
+    }
 }
 
 pub use config::Config;
-pub use flags::Flags;
+pub use flags::{Flags, Subcommand};
 
 /// A structure representing a Rust compiler.
 ///
@@ -111,32 +164,40 @@ pub struct Build {
     rustc: PathBuf,
     src: PathBuf,
     out: PathBuf,
-    release: String,
-    unstable_features: bool,
-    ver_hash: Option<String>,
-    short_ver_hash: Option<String>,
-    ver_date: Option<String>,
-    version: String,
-    package_vers: String,
+    rust_info: channel::GitInfo,
+    cargo_info: channel::GitInfo,
+    rls_info: channel::GitInfo,
     local_rebuild: bool,
-    bootstrap_key: String,
-    bootstrap_key_stage0: String,
 
     // Probed tools at runtime
-    gdb_version: Option<String>,
     lldb_version: Option<String>,
     lldb_python_dir: Option<String>,
 
     // Runtime state filled in later on
     cc: HashMap<String, (gcc::Tool, Option<PathBuf>)>,
     cxx: HashMap<String, gcc::Tool>,
+    crates: HashMap<String, Crate>,
+    is_sudo: bool,
+    src_is_git: bool,
+}
+
+#[derive(Debug)]
+struct Crate {
+    name: String,
+    version: String,
+    deps: Vec<String>,
+    path: PathBuf,
+    doc_step: String,
+    build_step: String,
+    test_step: String,
+    bench_step: String,
 }
 
 /// The various "modes" of invoking Cargo.
 ///
 /// These entries currently correspond to the various output directories of the
 /// build system, with each mod generating output in a different directory.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// This cargo is going to build the standard library, placing output in the
     /// "stageN-std" directory.
@@ -150,7 +211,7 @@ pub enum Mode {
     /// output in the "stageN-rustc" directory.
     Librustc,
 
-    /// This cargo is going to some build tool, placing output in the
+    /// This cargo is going to build some tool, placing output in the
     /// "stageN-tools" directory.
     Tool,
 }
@@ -162,7 +223,9 @@ impl Build {
     /// By default all build output will be placed in the current directory.
     pub fn new(flags: Flags, config: Config) -> Build {
         let cwd = t!(env::current_dir());
-        let src = flags.src.clone().unwrap_or(cwd.clone());
+        let src = flags.src.clone().or_else(|| {
+            env::var_os("SRC").map(|x| x.into())
+        }).unwrap_or(cwd.clone());
         let out = cwd.join("build");
 
         let stage0_root = out.join(&config.build).join("stage0/bin");
@@ -176,6 +239,20 @@ impl Build {
         };
         let local_rebuild = config.local_rebuild;
 
+        let is_sudo = match env::var_os("SUDO_USER") {
+            Some(sudo_user) => {
+                match env::var_os("USER") {
+                    Some(user) => user != sudo_user,
+                    None => false,
+                }
+            }
+            None => false,
+        };
+        let rust_info = channel::GitInfo::new(&src);
+        let cargo_info = channel::GitInfo::new(&src.join("src/tools/cargo"));
+        let rls_info = channel::GitInfo::new(&src.join("src/tools/rls"));
+        let src_is_git = src.join(".git").exists();
+
         Build {
             flags: flags,
             config: config,
@@ -184,33 +261,27 @@ impl Build {
             src: src,
             out: out,
 
-            release: String::new(),
-            unstable_features: false,
-            ver_hash: None,
-            short_ver_hash: None,
-            ver_date: None,
-            version: String::new(),
+            rust_info: rust_info,
+            cargo_info: cargo_info,
+            rls_info: rls_info,
             local_rebuild: local_rebuild,
-            bootstrap_key: String::new(),
-            bootstrap_key_stage0: String::new(),
-            package_vers: String::new(),
             cc: HashMap::new(),
             cxx: HashMap::new(),
-            gdb_version: None,
+            crates: HashMap::new(),
             lldb_version: None,
             lldb_python_dir: None,
+            is_sudo: is_sudo,
+            src_is_git: src_is_git,
         }
     }
 
     /// Executes the entire build, as configured by the flags and configuration.
     pub fn build(&mut self) {
-        use step::Source::*;
-
         unsafe {
-            job::setup();
+            job::setup(self);
         }
 
-        if self.flags.clean {
+        if let Subcommand::Clean = self.flags.cmd {
             return clean::clean(self);
         }
 
@@ -218,379 +289,21 @@ impl Build {
         cc::find(self);
         self.verbose("running sanity check");
         sanity::check(self);
-        self.verbose("collecting channel variables");
-        channel::collect(self);
-        // If local-rust is the same as the current version, then force a local-rebuild
+        // If local-rust is the same major.minor as the current version, then force a local-rebuild
         let local_version_verbose = output(
             Command::new(&self.rustc).arg("--version").arg("--verbose"));
         let local_release = local_version_verbose
             .lines().filter(|x| x.starts_with("release:"))
             .next().unwrap().trim_left_matches("release:").trim();
-        if local_release == self.release {
-            self.verbose(&format!("auto-detected local-rebuild {}", self.release));
+        let my_version = channel::CFG_RELEASE_NUM;
+        if local_release.split('.').take(2).eq(my_version.split('.').take(2)) {
+            self.verbose(&format!("auto-detected local-rebuild {}", local_release));
             self.local_rebuild = true;
         }
-        self.verbose("updating submodules");
-        self.update_submodules();
+        self.verbose("learning about cargo");
+        metadata::build(self);
 
-        // The main loop of the build system.
-        //
-        // The `step::all` function returns a topographically sorted list of all
-        // steps that need to be executed as part of this build. Each step has a
-        // corresponding entry in `step.rs` and indicates some unit of work that
-        // needs to be done as part of the build.
-        //
-        // Almost all of these are simple one-liners that shell out to the
-        // corresponding functionality in the extra modules, where more
-        // documentation can be found.
-        let steps = step::all(self);
-
-        self.verbose("bootstrap build plan:");
-        for step in &steps {
-            self.verbose(&format!("{:?}", step));
-        }
-
-        for target in steps {
-            let doc_out = self.out.join(&target.target).join("doc");
-            match target.src {
-                Llvm { _dummy } => {
-                    native::llvm(self, target.target);
-                }
-                TestHelpers { _dummy } => {
-                    native::test_helpers(self, target.target);
-                }
-                Libstd { compiler } => {
-                    compile::std(self, target.target, &compiler);
-                }
-                Libtest { compiler } => {
-                    compile::test(self, target.target, &compiler);
-                }
-                Librustc { compiler } => {
-                    compile::rustc(self, target.target, &compiler);
-                }
-                LibstdLink { compiler, host } => {
-                    compile::std_link(self, target.target, &compiler, host);
-                }
-                LibtestLink { compiler, host } => {
-                    compile::test_link(self, target.target, &compiler, host);
-                }
-                LibrustcLink { compiler, host } => {
-                    compile::rustc_link(self, target.target, &compiler, host);
-                }
-                Rustc { stage: 0 } => {
-                    // nothing to do...
-                }
-                Rustc { stage } => {
-                    compile::assemble_rustc(self, stage, target.target);
-                }
-                ToolLinkchecker { stage } => {
-                    compile::tool(self, stage, target.target, "linkchecker");
-                }
-                ToolRustbook { stage } => {
-                    compile::tool(self, stage, target.target, "rustbook");
-                }
-                ToolErrorIndex { stage } => {
-                    compile::tool(self, stage, target.target,
-                                  "error_index_generator");
-                }
-                ToolCargoTest { stage } => {
-                    compile::tool(self, stage, target.target, "cargotest");
-                }
-                ToolTidy { stage } => {
-                    compile::tool(self, stage, target.target, "tidy");
-                }
-                ToolCompiletest { stage } => {
-                    compile::tool(self, stage, target.target, "compiletest");
-                }
-                DocBook { stage } => {
-                    doc::rustbook(self, stage, target.target, "book", &doc_out);
-                }
-                DocNomicon { stage } => {
-                    doc::rustbook(self, stage, target.target, "nomicon",
-                                  &doc_out);
-                }
-                DocStandalone { stage } => {
-                    doc::standalone(self, stage, target.target, &doc_out);
-                }
-                DocStd { stage } => {
-                    doc::std(self, stage, target.target, &doc_out);
-                }
-                DocTest { stage } => {
-                    doc::test(self, stage, target.target, &doc_out);
-                }
-                DocRustc { stage } => {
-                    doc::rustc(self, stage, target.target, &doc_out);
-                }
-                DocErrorIndex { stage } => {
-                    doc::error_index(self, stage, target.target, &doc_out);
-                }
-
-                CheckLinkcheck { stage } => {
-                    check::linkcheck(self, stage, target.target);
-                }
-                CheckCargoTest { stage } => {
-                    check::cargotest(self, stage, target.target);
-                }
-                CheckTidy { stage } => {
-                    check::tidy(self, stage, target.target);
-                }
-                CheckRPass { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "run-pass", "run-pass");
-                }
-                CheckRPassFull { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "run-pass", "run-pass-fulldeps");
-                }
-                CheckCFail { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "compile-fail", "compile-fail");
-                }
-                CheckCFailFull { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "compile-fail", "compile-fail-fulldeps")
-                }
-                CheckPFail { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "parse-fail", "parse-fail");
-                }
-                CheckRFail { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "run-fail", "run-fail");
-                }
-                CheckRFailFull { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "run-fail", "run-fail-fulldeps");
-                }
-                CheckPretty { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "pretty", "pretty");
-                }
-                CheckPrettyRPass { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "pretty", "run-pass");
-                }
-                CheckPrettyRPassFull { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "pretty", "run-pass-fulldeps");
-                }
-                CheckPrettyRFail { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "pretty", "run-fail");
-                }
-                CheckPrettyRFailFull { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "pretty", "run-fail-fulldeps");
-                }
-                CheckPrettyRPassValgrind { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "pretty", "run-pass-valgrind");
-                }
-                CheckMirOpt { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "mir-opt", "mir-opt");
-                }
-                CheckCodegen { compiler } => {
-                    if self.config.codegen_tests {
-                        check::compiletest(self, &compiler, target.target,
-                                           "codegen", "codegen");
-                    }
-                }
-                CheckCodegenUnits { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "codegen-units", "codegen-units");
-                }
-                CheckIncremental { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "incremental", "incremental");
-                }
-                CheckUi { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "ui", "ui");
-                }
-                CheckDebuginfo { compiler } => {
-                    if target.target.contains("msvc") {
-                        // nothing to do
-                    } else if target.target.contains("apple") {
-                        check::compiletest(self, &compiler, target.target,
-                                           "debuginfo-lldb", "debuginfo");
-                    } else {
-                        check::compiletest(self, &compiler, target.target,
-                                           "debuginfo-gdb", "debuginfo");
-                    }
-                }
-                CheckRustdoc { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "rustdoc", "rustdoc");
-                }
-                CheckRPassValgrind { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "run-pass-valgrind", "run-pass-valgrind");
-                }
-                CheckDocs { compiler } => {
-                    check::docs(self, &compiler);
-                }
-                CheckErrorIndex { compiler } => {
-                    check::error_index(self, &compiler);
-                }
-                CheckRMake { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "run-make", "run-make")
-                }
-                CheckCrateStd { compiler } => {
-                    check::krate(self, &compiler, target.target, Mode::Libstd)
-                }
-                CheckCrateTest { compiler } => {
-                    check::krate(self, &compiler, target.target, Mode::Libtest)
-                }
-                CheckCrateRustc { compiler } => {
-                    check::krate(self, &compiler, target.target, Mode::Librustc)
-                }
-
-                DistDocs { stage } => dist::docs(self, stage, target.target),
-                DistMingw { _dummy } => dist::mingw(self, target.target),
-                DistRustc { stage } => dist::rustc(self, stage, target.target),
-                DistStd { compiler } => dist::std(self, &compiler, target.target),
-                DistSrc { _dummy } => dist::rust_src(self),
-
-                Install { stage } => install::install(self, stage, target.target),
-
-                DebuggerScripts { stage } => {
-                    let compiler = Compiler::new(stage, target.target);
-                    dist::debugger_scripts(self,
-                                           &self.sysroot(&compiler),
-                                           target.target);
-                }
-
-                AndroidCopyLibs { compiler } => {
-                    check::android_copy_libs(self, &compiler, target.target);
-                }
-
-                // pseudo-steps
-                Dist { .. } |
-                Doc { .. } |
-                CheckTarget { .. } |
-                Check { .. } => {}
-            }
-        }
-    }
-
-    /// Updates all git submodules that we have.
-    ///
-    /// This will detect if any submodules are out of date an run the necessary
-    /// commands to sync them all with upstream.
-    fn update_submodules(&self) {
-        struct Submodule<'a> {
-            path: &'a Path,
-            state: State,
-        }
-
-        enum State {
-            // The submodule may have staged/unstaged changes
-            MaybeDirty,
-            // Or could be initialized but never updated
-            NotInitialized,
-            // The submodule, itself, has extra commits but those changes haven't been commited to
-            // the (outer) git repository
-            OutOfSync,
-        }
-
-        if !self.config.submodules {
-            return
-        }
-        if fs::metadata(self.src.join(".git")).is_err() {
-            return
-        }
-        let git = || {
-            let mut cmd = Command::new("git");
-            cmd.current_dir(&self.src);
-            return cmd
-        };
-        let git_submodule = || {
-            let mut cmd = Command::new("git");
-            cmd.current_dir(&self.src).arg("submodule");
-            return cmd
-        };
-
-        // FIXME: this takes a seriously long time to execute on Windows and a
-        //        nontrivial amount of time on Unix, we should have a better way
-        //        of detecting whether we need to run all the submodule commands
-        //        below.
-        let out = output(git_submodule().arg("status"));
-        let mut submodules = vec![];
-        for line in out.lines() {
-            // NOTE `git submodule status` output looks like this:
-            //
-            // -5066b7dcab7e700844b0e2ba71b8af9dc627a59b src/liblibc
-            // +b37ef24aa82d2be3a3cc0fe89bf82292f4ca181c src/compiler-rt (remotes/origin/..)
-            //  e058ca661692a8d01f8cf9d35939dfe3105ce968 src/jemalloc (3.6.0-533-ge058ca6)
-            //
-            // The first character can be '-', '+' or ' ' and denotes the `State` of the submodule
-            // Right next to this character is the SHA-1 of the submodule HEAD
-            // And after that comes the path to the submodule
-            let path = Path::new(line[1..].split(' ').skip(1).next().unwrap());
-            let state = if line.starts_with('-') {
-                State::NotInitialized
-            } else if line.starts_with('+') {
-                State::OutOfSync
-            } else if line.starts_with(' ') {
-                State::MaybeDirty
-            } else {
-                panic!("unexpected git submodule state: {:?}", line.chars().next());
-            };
-
-            submodules.push(Submodule { path: path, state: state })
-        }
-
-        self.run(git_submodule().arg("sync"));
-
-        for submodule in submodules {
-            // If using llvm-root then don't touch the llvm submodule.
-            if submodule.path.components().any(|c| c == Component::Normal("llvm".as_ref())) &&
-                self.config.target_config.get(&self.config.build)
-                    .and_then(|c| c.llvm_config.as_ref()).is_some()
-            {
-                continue
-            }
-
-            if submodule.path.components().any(|c| c == Component::Normal("jemalloc".as_ref())) &&
-                !self.config.use_jemalloc
-            {
-                continue
-            }
-
-            // `submodule.path` is the relative path to a submodule (from the repository root)
-            // `submodule_path` is the path to a submodule from the cwd
-
-            // use `submodule.path` when e.g. executing a submodule specific command from the
-            // repository root
-            // use `submodule_path` when e.g. executing a normal git command for the submodule
-            // (set via `current_dir`)
-            let submodule_path = self.src.join(submodule.path);
-
-            match submodule.state {
-                State::MaybeDirty => {
-                    // drop staged changes
-                    self.run(git().current_dir(&submodule_path)
-                                  .args(&["reset", "--hard"]));
-                    // drops unstaged changes
-                    self.run(git().current_dir(&submodule_path)
-                                  .args(&["clean", "-fdx"]));
-                },
-                State::NotInitialized => {
-                    self.run(git_submodule().arg("init").arg(submodule.path));
-                    self.run(git_submodule().arg("update").arg(submodule.path));
-                },
-                State::OutOfSync => {
-                    // drops submodule commits that weren't reported to the (outer) git repository
-                    self.run(git_submodule().arg("update").arg(submodule.path));
-                    self.run(git().current_dir(&submodule_path)
-                                  .args(&["reset", "--hard"]));
-                    self.run(git().current_dir(&submodule_path)
-                                  .args(&["clean", "-fdx"]));
-                },
-            }
-        }
+        step::run(self);
     }
 
     /// Clear out `dir` if `input` is newer.
@@ -644,25 +357,110 @@ impl Build {
         // how the actual compiler itself is called.
         //
         // These variables are primarily all read by
-        // src/bootstrap/{rustc,rustdoc.rs}
-        cargo.env("RUSTC", self.out.join("bootstrap/debug/rustc"))
+        // src/bootstrap/bin/{rustc.rs,rustdoc.rs}
+        cargo.env("RUSTBUILD_NATIVE_DIR", self.native_dir(target))
+             .env("RUSTC", self.out.join("bootstrap/debug/rustc"))
              .env("RUSTC_REAL", self.compiler_path(compiler))
              .env("RUSTC_STAGE", stage.to_string())
-             .env("RUSTC_DEBUGINFO", self.config.rust_debuginfo.to_string())
              .env("RUSTC_CODEGEN_UNITS",
                   self.config.rust_codegen_units.to_string())
              .env("RUSTC_DEBUG_ASSERTIONS",
                   self.config.rust_debug_assertions.to_string())
-             .env("RUSTC_SNAPSHOT", &self.rustc)
              .env("RUSTC_SYSROOT", self.sysroot(compiler))
              .env("RUSTC_LIBDIR", self.rustc_libdir(compiler))
-             .env("RUSTC_SNAPSHOT_LIBDIR", self.rustc_snapshot_libdir())
              .env("RUSTC_RPATH", self.config.rust_rpath.to_string())
              .env("RUSTDOC", self.out.join("bootstrap/debug/rustdoc"))
              .env("RUSTDOC_REAL", self.rustdoc(compiler))
              .env("RUSTC_FLAGS", self.rustc_flags(target).join(" "));
 
-        self.add_bootstrap_key(compiler, &mut cargo);
+        if mode != Mode::Tool {
+            // Tools don't get debuginfo right now, e.g. cargo and rls don't
+            // get compiled with debuginfo.
+            cargo.env("RUSTC_DEBUGINFO", self.config.rust_debuginfo.to_string())
+                 .env("RUSTC_DEBUGINFO_LINES", self.config.rust_debuginfo_lines.to_string())
+                 .env("RUSTC_FORCE_UNSTABLE", "1");
+
+            // Currently the compiler depends on crates from crates.io, and
+            // then other crates can depend on the compiler (e.g. proc-macro
+            // crates). Let's say, for example that rustc itself depends on the
+            // bitflags crate. If an external crate then depends on the
+            // bitflags crate as well, we need to make sure they don't
+            // conflict, even if they pick the same verison of bitflags. We'll
+            // want to make sure that e.g. a plugin and rustc each get their
+            // own copy of bitflags.
+
+            // Cargo ensures that this works in general through the -C metadata
+            // flag. This flag will frob the symbols in the binary to make sure
+            // they're different, even though the source code is the exact
+            // same. To solve this problem for the compiler we extend Cargo's
+            // already-passed -C metadata flag with our own. Our rustc.rs
+            // wrapper around the actual rustc will detect -C metadata being
+            // passed and frob it with this extra string we're passing in.
+            cargo.env("RUSTC_METADATA_SUFFIX", "rustc");
+        }
+
+        // Enable usage of unstable features
+        cargo.env("RUSTC_BOOTSTRAP", "1");
+        self.add_rust_test_threads(&mut cargo);
+
+        // Almost all of the crates that we compile as part of the bootstrap may
+        // have a build script, including the standard library. To compile a
+        // build script, however, it itself needs a standard library! This
+        // introduces a bit of a pickle when we're compiling the standard
+        // library itself.
+        //
+        // To work around this we actually end up using the snapshot compiler
+        // (stage0) for compiling build scripts of the standard library itself.
+        // The stage0 compiler is guaranteed to have a libstd available for use.
+        //
+        // For other crates, however, we know that we've already got a standard
+        // library up and running, so we can use the normal compiler to compile
+        // build scripts in that situation.
+        if mode == Mode::Libstd {
+            cargo.env("RUSTC_SNAPSHOT", &self.rustc)
+                 .env("RUSTC_SNAPSHOT_LIBDIR", self.rustc_snapshot_libdir());
+        } else {
+            cargo.env("RUSTC_SNAPSHOT", self.compiler_path(compiler))
+                 .env("RUSTC_SNAPSHOT_LIBDIR", self.rustc_libdir(compiler));
+        }
+
+        // There are two invariants we must maintain:
+        // * stable crates cannot depend on unstable crates (general Rust rule),
+        // * crates that end up in the sysroot must be unstable (rustbuild rule).
+        //
+        // In order to do enforce the latter, we pass the env var
+        // `RUSTBUILD_UNSTABLE` down the line for any crates which will end up
+        // in the sysroot. We read this in bootstrap/bin/rustc.rs and if it is
+        // set, then we pass the `rustbuild` feature to rustc when building the
+        // the crate.
+        //
+        // In turn, crates that can be used here should recognise the `rustbuild`
+        // feature and opt-in to `rustc_private`.
+        //
+        // We can't always pass `rustbuild` because crates which are outside of
+        // the compiler, libs, and tests are stable and we don't want to make
+        // their deps unstable (since this would break the first invariant
+        // above).
+        //
+        // FIXME: remove this after next stage0
+        if mode != Mode::Tool && stage == 0 {
+            cargo.env("RUSTBUILD_UNSTABLE", "1");
+        }
+
+        // Ignore incremental modes except for stage0, since we're
+        // not guaranteeing correctness across builds if the compiler
+        // is changing under your feet.`
+        if self.flags.incremental && compiler.stage == 0 {
+            let incr_dir = self.incremental_dir(compiler);
+            cargo.env("RUSTC_INCREMENTAL", incr_dir);
+        }
+
+        if let Some(ref on_fail) = self.flags.on_fail {
+            cargo.env("RUSTC_ON_FAIL", on_fail);
+        }
+
+        let verbose = cmp::max(self.config.verbose, self.flags.verbose);
+        cargo.env("RUSTC_VERBOSE", format!("{}", verbose));
 
         // Specify some various options for build scripts used throughout
         // the build.
@@ -674,16 +472,40 @@ impl Build {
                  .env(format!("CFLAGS_{}", target), self.cflags(target).join(" "));
         }
 
-        // Environment variables *required* needed throughout the build
+        if self.config.extended && compiler.is_final_stage(self) {
+            cargo.env("RUSTC_SAVE_ANALYSIS", "api".to_string());
+        }
+
+        // When being built Cargo will at some point call `nmake.exe` on Windows
+        // MSVC. Unfortunately `nmake` will read these two environment variables
+        // below and try to intepret them. We're likely being run, however, from
+        // MSYS `make` which uses the same variables.
+        //
+        // As a result, to prevent confusion and errors, we remove these
+        // variables from our environment to prevent passing MSYS make flags to
+        // nmake, causing it to blow up.
+        if cfg!(target_env = "msvc") {
+            cargo.env_remove("MAKE");
+            cargo.env_remove("MAKEFLAGS");
+        }
+
+        // Environment variables *required* throughout the build
         //
         // FIXME: should update code to not require this env var
         cargo.env("CFG_COMPILER_HOST_TRIPLE", target);
 
-        if self.config.verbose || self.flags.verbose {
+        if self.config.verbose() || self.flags.verbose() {
             cargo.arg("-v");
         }
-        if self.config.rust_optimize {
+        // FIXME: cargo bench does not accept `--release`
+        if self.config.rust_optimize && cmd != "bench" {
             cargo.arg("--release");
+        }
+        if self.config.locked_deps {
+            cargo.arg("--locked");
+        }
+        if self.config.vendor || self.is_sudo {
+            cargo.arg("--frozen");
         }
         return cargo
     }
@@ -715,21 +537,46 @@ impl Build {
     /// `host`.
     fn tool_cmd(&self, compiler: &Compiler, tool: &str) -> Command {
         let mut cmd = Command::new(self.tool(&compiler, tool));
+        self.prepare_tool_cmd(compiler, &mut cmd);
+        return cmd
+    }
+
+    /// Prepares the `cmd` provided to be able to run the `compiler` provided.
+    ///
+    /// Notably this munges the dynamic library lookup path to point to the
+    /// right location to run `compiler`.
+    fn prepare_tool_cmd(&self, compiler: &Compiler, cmd: &mut Command) {
         let host = compiler.host;
-        let paths = vec![
-            self.cargo_out(compiler, Mode::Libstd, host).join("deps"),
-            self.cargo_out(compiler, Mode::Libtest, host).join("deps"),
-            self.cargo_out(compiler, Mode::Librustc, host).join("deps"),
+        let mut paths = vec![
+            self.sysroot_libdir(compiler, compiler.host),
             self.cargo_out(compiler, Mode::Tool, host).join("deps"),
         ];
-        add_lib_path(paths, &mut cmd);
-        return cmd
+
+        // On MSVC a tool may invoke a C compiler (e.g. compiletest in run-make
+        // mode) and that C compiler may need some extra PATH modification. Do
+        // so here.
+        if compiler.host.contains("msvc") {
+            let curpaths = env::var_os("PATH").unwrap_or(OsString::new());
+            let curpaths = env::split_paths(&curpaths).collect::<Vec<_>>();
+            for &(ref k, ref v) in self.cc[compiler.host].0.env() {
+                if k != "PATH" {
+                    continue
+                }
+                for path in env::split_paths(v) {
+                    if !curpaths.contains(&path) {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+        add_lib_path(paths, cmd);
     }
 
     /// Get the space-separated set of activated features for the standard
     /// library.
     fn std_features(&self) -> String {
-        let mut features = String::new();
+        let mut features = "panic-unwind".to_string();
+
         if self.config.debug_jemalloc {
             features.push_str(" debug-jemalloc");
         }
@@ -771,6 +618,12 @@ impl Build {
         }
     }
 
+    /// Get the directory for incremental by-products when using the
+    /// given compiler.
+    fn incremental_dir(&self, compiler: &Compiler) -> PathBuf {
+        self.out.join(compiler.host).join(format!("stage{}-incremental", compiler.stage))
+    }
+
     /// Returns the libdir where the standard library and other artifacts are
     /// found for a compiler's sysroot.
     fn sysroot_libdir(&self, compiler: &Compiler, target: &str) -> PathBuf {
@@ -794,7 +647,7 @@ impl Build {
     }
 
     /// Returns the root output directory for all Cargo output in a given stage,
-    /// running a particular comipler, wehther or not we're building the
+    /// running a particular compiler, wehther or not we're building the
     /// standard library, and targeting the specified architecture.
     fn cargo_out(&self,
                  compiler: &Compiler,
@@ -809,6 +662,18 @@ impl Build {
     /// will likely be empty.
     fn llvm_out(&self, target: &str) -> PathBuf {
         self.out.join(target).join("llvm")
+    }
+
+    /// Output directory for all documentation for a target
+    fn doc_out(&self, target: &str) -> PathBuf {
+        self.out.join(target).join("doc")
+    }
+
+    /// Output directory for all crate documentation for a target (temporary)
+    ///
+    /// The artifacts here are then copied into `doc_out` above.
+    fn crate_doc_out(&self, target: &str) -> PathBuf {
+        self.out.join(target).join("crate-docs")
     }
 
     /// Returns true if no custom `llvm-config` is set for the specified target.
@@ -839,11 +704,12 @@ impl Build {
     fn llvm_filecheck(&self, target: &str) -> PathBuf {
         let target_config = self.config.target_config.get(target);
         if let Some(s) = target_config.and_then(|c| c.llvm_config.as_ref()) {
-            s.parent().unwrap().join(exe("FileCheck", target))
+            let llvm_bindir = output(Command::new(s).arg("--bindir"));
+            Path::new(llvm_bindir.trim()).join(exe("FileCheck", target))
         } else {
             let base = self.llvm_out(&self.config.build).join("build");
             let exe = exe("FileCheck", target);
-            if self.config.build.contains("msvc") {
+            if !self.config.ninja && self.config.build.contains("msvc") {
                 base.join("Release/bin").join(exe)
             } else {
                 base.join("bin").join(exe)
@@ -851,10 +717,15 @@ impl Build {
         }
     }
 
+    /// Directory for libraries built from C/C++ code and shared between stages.
+    fn native_dir(&self, target: &str) -> PathBuf {
+        self.out.join(target).join("native")
+    }
+
     /// Root output directory for rust_test_helpers library compiled for
     /// `target`
     fn test_helpers_out(&self, target: &str) -> PathBuf {
-        self.out.join(target).join("rust-test-helpers")
+        self.native_dir(target).join("rust-test-helpers")
     }
 
     /// Adds the compiler's directory of dynamic libraries to `cmd`'s dynamic
@@ -870,17 +741,11 @@ impl Build {
         add_lib_path(vec![self.rustc_libdir(compiler)], cmd);
     }
 
-    /// Adds the compiler's bootstrap key to the environment of `cmd`.
-    fn add_bootstrap_key(&self, compiler: &Compiler, cmd: &mut Command) {
-        // In stage0 we're using a previously released stable compiler, so we
-        // use the stage0 bootstrap key. Otherwise we use our own build's
-        // bootstrap key.
-        let bootstrap_key = if compiler.is_snapshot(self) && !self.local_rebuild {
-            &self.bootstrap_key_stage0
-        } else {
-            &self.bootstrap_key
-        };
-        cmd.env("RUSTC_BOOTSTRAP_KEY", bootstrap_key);
+    /// Adds the `RUST_TEST_THREADS` env var if necessary
+    fn add_rust_test_threads(&self, cmd: &mut Command) {
+        if env::var_os("RUST_TEST_THREADS").is_none() {
+            cmd.env("RUST_TEST_THREADS", self.jobs().to_string());
+        }
     }
 
     /// Returns the compiler's libdir where it stores the dynamic libraries that
@@ -908,9 +773,15 @@ impl Build {
         run_silent(cmd)
     }
 
+    /// Runs a command, printing out nice contextual information if it fails.
+    fn run_quiet(&self, cmd: &mut Command) {
+        self.verbose(&format!("running: {:?}", cmd));
+        run_suppressed(cmd)
+    }
+
     /// Prints a message if this build is configured in verbose mode.
     fn verbose(&self, msg: &str) {
-        if self.flags.verbose || self.config.verbose {
+        if self.flags.verbose() || self.config.verbose() {
             println!("{}", msg);
         }
     }
@@ -936,23 +807,19 @@ impl Build {
                            .filter(|s| !s.starts_with("-O") && !s.starts_with("/O"))
                            .collect::<Vec<_>>();
 
-        // If we're compiling on OSX then we add a few unconditional flags
+        // If we're compiling on macOS then we add a few unconditional flags
         // indicating that we want libc++ (more filled out than libstdc++) and
         // we want to compile for 10.7. This way we can ensure that
         // LLVM/jemalloc/etc are all properly compiled.
         if target.contains("apple-darwin") {
             base.push("-stdlib=libc++".into());
         }
-        // This is a hack, because newer binutils broke things on some vms/distros
-        // (i.e., linking against unknown relocs disabled by the following flag)
-        // See: https://github.com/rust-lang/rust/issues/34978
-        match target {
-            "i586-unknown-linux-gnu" |
-            "i686-unknown-linux-musl" |
-            "x86_64-unknown-linux-musl" => {
-                base.push("-Wa,-mrelax-relocations=no".into());
-            },
-            _ => {},
+
+        // Work around an apparently bad MinGW / GCC optimization,
+        // See: http://lists.llvm.org/pipermail/cfe-dev/2016-December/051980.html
+        // See: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=78936
+        if target == "i686-pc-windows-gnu" {
+            base.push("-fno-omit-frame-pointer".into());
         }
         return base
     }
@@ -996,6 +863,154 @@ impl Build {
             .or(self.config.musl_root.as_ref())
             .map(|p| &**p)
     }
+
+    /// Returns whether the target will be tested using the `remote-test-client`
+    /// and `remote-test-server` binaries.
+    fn remote_tested(&self, target: &str) -> bool {
+        self.qemu_rootfs(target).is_some() || target.contains("android")
+    }
+
+    /// Returns the root of the "rootfs" image that this target will be using,
+    /// if one was configured.
+    ///
+    /// If `Some` is returned then that means that tests for this target are
+    /// emulated with QEMU and binaries will need to be shipped to the emulator.
+    fn qemu_rootfs(&self, target: &str) -> Option<&Path> {
+        self.config.target_config.get(target)
+            .and_then(|t| t.qemu_rootfs.as_ref())
+            .map(|p| &**p)
+    }
+
+    /// Path to the python interpreter to use
+    fn python(&self) -> &Path {
+        self.config.python.as_ref().unwrap()
+    }
+
+    /// Tests whether the `compiler` compiling for `target` should be forced to
+    /// use a stage1 compiler instead.
+    ///
+    /// Currently, by default, the build system does not perform a "full
+    /// bootstrap" by default where we compile the compiler three times.
+    /// Instead, we compile the compiler two times. The final stage (stage2)
+    /// just copies the libraries from the previous stage, which is what this
+    /// method detects.
+    ///
+    /// Here we return `true` if:
+    ///
+    /// * The build isn't performing a full bootstrap
+    /// * The `compiler` is in the final stage, 2
+    /// * We're not cross-compiling, so the artifacts are already available in
+    ///   stage1
+    ///
+    /// When all of these conditions are met the build will lift artifacts from
+    /// the previous stage forward.
+    fn force_use_stage1(&self, compiler: &Compiler, target: &str) -> bool {
+        !self.config.full_bootstrap &&
+            compiler.stage >= 2 &&
+            self.config.host.iter().any(|h| h == target)
+    }
+
+    /// Returns the directory that OpenSSL artifacts are compiled into if
+    /// configured to do so.
+    fn openssl_dir(&self, target: &str) -> Option<PathBuf> {
+        // OpenSSL not used on Windows
+        if target.contains("windows") {
+            None
+        } else if self.config.openssl_static {
+            Some(self.out.join(target).join("openssl"))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the directory that OpenSSL artifacts are installed into if
+    /// configured as such.
+    fn openssl_install_dir(&self, target: &str) -> Option<PathBuf> {
+        self.openssl_dir(target).map(|p| p.join("install"))
+    }
+
+    /// Given `num` in the form "a.b.c" return a "release string" which
+    /// describes the release version number.
+    ///
+    /// For example on nightly this returns "a.b.c-nightly", on beta it returns
+    /// "a.b.c-beta.1" and on stable it just returns "a.b.c".
+    fn release(&self, num: &str) -> String {
+        match &self.config.channel[..] {
+            "stable" => num.to_string(),
+            "beta" => format!("{}-beta{}", num, channel::CFG_PRERELEASE_VERSION),
+            "nightly" => format!("{}-nightly", num),
+            _ => format!("{}-dev", num),
+        }
+    }
+
+    /// Returns the value of `release` above for Rust itself.
+    fn rust_release(&self) -> String {
+        self.release(channel::CFG_RELEASE_NUM)
+    }
+
+    /// Returns the "package version" for a component given the `num` release
+    /// number.
+    ///
+    /// The package version is typically what shows up in the names of tarballs.
+    /// For channels like beta/nightly it's just the channel name, otherwise
+    /// it's the `num` provided.
+    fn package_vers(&self, num: &str) -> String {
+        match &self.config.channel[..] {
+            "stable" => num.to_string(),
+            "beta" => "beta".to_string(),
+            "nightly" => "nightly".to_string(),
+            _ => format!("{}-dev", num),
+        }
+    }
+
+    /// Returns the value of `package_vers` above for Rust itself.
+    fn rust_package_vers(&self) -> String {
+        self.package_vers(channel::CFG_RELEASE_NUM)
+    }
+
+    /// Returns the value of `package_vers` above for Cargo
+    fn cargo_package_vers(&self) -> String {
+        self.package_vers(&self.release_num("cargo"))
+    }
+
+    /// Returns the value of `package_vers` above for rls
+    fn rls_package_vers(&self) -> String {
+        self.package_vers(&self.release_num("rls"))
+    }
+
+    /// Returns the `version` string associated with this compiler for Rust
+    /// itself.
+    ///
+    /// Note that this is a descriptive string which includes the commit date,
+    /// sha, version, etc.
+    fn rust_version(&self) -> String {
+        self.rust_info.version(self, channel::CFG_RELEASE_NUM)
+    }
+
+    /// Returns the `a.b.c` version that the given package is at.
+    fn release_num(&self, package: &str) -> String {
+        let mut toml = String::new();
+        let toml_file_name = self.src.join(&format!("src/tools/{}/Cargo.toml", package));
+        t!(t!(File::open(toml_file_name)).read_to_string(&mut toml));
+        for line in toml.lines() {
+            let prefix = "version = \"";
+            let suffix = "\"";
+            if line.starts_with(prefix) && line.ends_with(suffix) {
+                return line[prefix.len()..line.len() - suffix.len()].to_string()
+            }
+        }
+
+        panic!("failed to find version in {}'s Cargo.toml", package)
+    }
+
+    /// Returns whether unstable features should be enabled for the compiler
+    /// we're building.
+    fn unstable_features(&self) -> bool {
+        match &self.config.channel[..] {
+            "stable" | "beta" => false,
+            "nightly" | _ => true,
+        }
+    }
 }
 
 impl<'a> Compiler<'a> {
@@ -1007,5 +1022,14 @@ impl<'a> Compiler<'a> {
     /// Returns whether this is a snapshot compiler for `build`'s configuration
     fn is_snapshot(&self, build: &Build) -> bool {
         self.stage == 0 && self.host == build.config.build
+    }
+
+    /// Returns if this compiler should be treated as a final stage one in the
+    /// current build session.
+    /// This takes into account whether we're performing a full bootstrap or
+    /// not; don't directly compare the stage with `2`!
+    fn is_final_stage(&self, build: &Build) -> bool {
+        let final_stage = if build.config.full_bootstrap { 2 } else { 1 };
+        self.stage >= final_stage
     }
 }

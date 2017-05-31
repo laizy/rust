@@ -26,7 +26,7 @@ impl Foo for Def {
 
 pub fn test<A: Foo, B: Foo>() {
     let _array: [u32; <A as Foo>::Y];
-    //~^ ERROR the trait bound `A: Foo` is not satisfied
+    //~^ ERROR the trait bound `A: Foo` is not satisfied [E0277]
 }
 
 fn main() {

@@ -13,10 +13,11 @@ use rustc::middle::privacy::{AccessLevels, AccessLevel};
 use rustc::hir::def::Def;
 use rustc::hir::def_id::{CrateNum, CRATE_DEF_INDEX, DefId};
 use rustc::ty::Visibility;
+use rustc::util::nodemap::FxHashSet;
 
 use std::cell::RefMut;
 
-use clean::{Attributes, Clean};
+use clean::{AttributesExt, NestedAttributesExt};
 
 // FIXME: this may not be exhaustive, but is sufficient for rustdocs current uses
 
@@ -24,11 +25,13 @@ use clean::{Attributes, Clean};
 /// specific rustdoc annotations into account (i.e. `doc(hidden)`)
 pub struct LibEmbargoVisitor<'a, 'b: 'a, 'tcx: 'b> {
     cx: &'a ::core::DocContext<'b, 'tcx>,
-    cstore: &'a CrateStore<'tcx>,
+    cstore: &'a CrateStore,
     // Accessibility levels for reachable nodes
     access_levels: RefMut<'a, AccessLevels<DefId>>,
     // Previous accessibility level, None means unreachable
     prev_level: Option<AccessLevel>,
+    // Keeps track of already visited modules, in case a module re-exports its parent
+    visited_mods: FxHashSet<DefId>,
 }
 
 impl<'a, 'b, 'tcx> LibEmbargoVisitor<'a, 'b, 'tcx> {
@@ -38,6 +41,7 @@ impl<'a, 'b, 'tcx> LibEmbargoVisitor<'a, 'b, 'tcx> {
             cstore: &*cx.sess().cstore,
             access_levels: cx.access_levels.borrow_mut(),
             prev_level: Some(AccessLevel::Public),
+            visited_mods: FxHashSet()
         }
     }
 
@@ -49,10 +53,7 @@ impl<'a, 'b, 'tcx> LibEmbargoVisitor<'a, 'b, 'tcx> {
 
     // Updates node level and returns the updated level
     fn update(&mut self, did: DefId, level: Option<AccessLevel>) -> Option<AccessLevel> {
-        let attrs: Vec<_> = self.cx.tcx().get_attrs(did).iter()
-                                                        .map(|a| a.clean(self.cx))
-                                                        .collect();
-        let is_hidden = attrs.list("doc").has_word("hidden");
+        let is_hidden = self.cx.tcx.get_attrs(did).lists("doc").has_word("hidden");
 
         let old_level = self.access_levels.map.get(&did).cloned();
         // Accessibility levels can only grow
@@ -65,6 +66,10 @@ impl<'a, 'b, 'tcx> LibEmbargoVisitor<'a, 'b, 'tcx> {
     }
 
     pub fn visit_mod(&mut self, def_id: DefId) {
+        if !self.visited_mods.insert(def_id) {
+            return;
+        }
+
         for item in self.cstore.item_children(def_id) {
             self.visit_item(item.def);
         }

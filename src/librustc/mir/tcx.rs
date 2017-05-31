@@ -13,11 +13,12 @@
  * building is complete.
  */
 
-use mir::repr::*;
+use mir::*;
 use ty::subst::{Subst, Substs};
 use ty::{self, AdtDef, Ty, TyCtxt};
 use ty::fold::{TypeFoldable, TypeFolder, TypeVisitor};
 use hir;
+use ty::util::IntTypeExt;
 
 #[derive(Copy, Clone, Debug)]
 pub enum LvalueTy<'tcx> {
@@ -25,7 +26,7 @@ pub enum LvalueTy<'tcx> {
     Ty { ty: Ty<'tcx> },
 
     /// Downcast to a particular variant of an enum.
-    Downcast { adt_def: AdtDef<'tcx>,
+    Downcast { adt_def: &'tcx AdtDef,
                substs: &'tcx Substs<'tcx>,
                variant_index: usize },
 }
@@ -124,8 +125,8 @@ impl<'tcx> Lvalue<'tcx> {
         match *self {
             Lvalue::Local(index) =>
                 LvalueTy::Ty { ty: mir.local_decls[index].ty },
-            Lvalue::Static(def_id) =>
-                LvalueTy::Ty { ty: tcx.lookup_item_type(def_id).ty },
+            Lvalue::Static(ref data) =>
+                LvalueTy::Ty { ty: data.ty },
             Lvalue::Projection(ref proj) =>
                 proj.base.ty(mir, tcx).projection_ty(tcx, &proj.elem),
         }
@@ -133,69 +134,73 @@ impl<'tcx> Lvalue<'tcx> {
 }
 
 impl<'tcx> Rvalue<'tcx> {
-    pub fn ty<'a, 'gcx>(&self, mir: &Mir<'tcx>, tcx: TyCtxt<'a, 'gcx, 'tcx>) -> Option<Ty<'tcx>>
+    pub fn ty<'a, 'gcx>(&self, mir: &Mir<'tcx>, tcx: TyCtxt<'a, 'gcx, 'tcx>) -> Ty<'tcx>
     {
-        match self {
-            &Rvalue::Use(ref operand) => Some(operand.ty(mir, tcx)),
-            &Rvalue::Repeat(ref operand, ref count) => {
+        match *self {
+            Rvalue::Use(ref operand) => operand.ty(mir, tcx),
+            Rvalue::Repeat(ref operand, ref count) => {
                 let op_ty = operand.ty(mir, tcx);
-                let count = count.value.as_u64(tcx.sess.target.uint_type);
+                let count = count.as_u64(tcx.sess.target.uint_type);
                 assert_eq!(count as usize as u64, count);
-                Some(tcx.mk_array(op_ty, count as usize))
+                tcx.mk_array(op_ty, count as usize)
             }
-            &Rvalue::Ref(reg, bk, ref lv) => {
+            Rvalue::Ref(reg, bk, ref lv) => {
                 let lv_ty = lv.ty(mir, tcx).to_ty(tcx);
-                Some(tcx.mk_ref(reg,
+                tcx.mk_ref(reg,
                     ty::TypeAndMut {
                         ty: lv_ty,
                         mutbl: bk.to_mutbl_lossy()
                     }
-                ))
+                )
             }
-            &Rvalue::Len(..) => Some(tcx.types.usize),
-            &Rvalue::Cast(.., ty) => Some(ty),
-            &Rvalue::BinaryOp(op, ref lhs, ref rhs) => {
+            Rvalue::Len(..) => tcx.types.usize,
+            Rvalue::Cast(.., ty) => ty,
+            Rvalue::BinaryOp(op, ref lhs, ref rhs) => {
                 let lhs_ty = lhs.ty(mir, tcx);
                 let rhs_ty = rhs.ty(mir, tcx);
-                Some(op.ty(tcx, lhs_ty, rhs_ty))
+                op.ty(tcx, lhs_ty, rhs_ty)
             }
-            &Rvalue::CheckedBinaryOp(op, ref lhs, ref rhs) => {
+            Rvalue::CheckedBinaryOp(op, ref lhs, ref rhs) => {
                 let lhs_ty = lhs.ty(mir, tcx);
                 let rhs_ty = rhs.ty(mir, tcx);
                 let ty = op.ty(tcx, lhs_ty, rhs_ty);
-                let ty = tcx.mk_tup(vec![ty, tcx.types.bool]);
-                Some(ty)
+                tcx.intern_tup(&[ty, tcx.types.bool], false)
             }
-            &Rvalue::UnaryOp(_, ref operand) => {
-                Some(operand.ty(mir, tcx))
+            Rvalue::UnaryOp(UnOp::Not, ref operand) |
+            Rvalue::UnaryOp(UnOp::Neg, ref operand) => {
+                operand.ty(mir, tcx)
             }
-            &Rvalue::Box(t) => {
-                Some(tcx.mk_box(t))
+            Rvalue::Discriminant(ref lval) => {
+                let ty = lval.ty(mir, tcx).to_ty(tcx);
+                if let ty::TyAdt(adt_def, _) = ty.sty {
+                    adt_def.repr.discr_type().to_ty(tcx)
+                } else {
+                    // Undefined behaviour, bug for now; may want to return something for
+                    // the `discriminant` intrinsic later.
+                    bug!("Rvalue::Discriminant on Lvalue of type {:?}", ty);
+                }
             }
-            &Rvalue::Aggregate(ref ak, ref ops) => {
-                match *ak {
-                    AggregateKind::Array => {
-                        if let Some(operand) = ops.get(0) {
-                            let ty = operand.ty(mir, tcx);
-                            Some(tcx.mk_array(ty, ops.len()))
-                        } else {
-                            None
-                        }
+            Rvalue::NullaryOp(NullOp::Box, t) => tcx.mk_box(t),
+            Rvalue::NullaryOp(NullOp::SizeOf, _) => tcx.types.usize,
+            Rvalue::Aggregate(ref ak, ref ops) => {
+                match **ak {
+                    AggregateKind::Array(ty) => {
+                        tcx.mk_array(ty, ops.len())
                     }
                     AggregateKind::Tuple => {
-                        Some(tcx.mk_tup(
-                            ops.iter().map(|op| op.ty(mir, tcx)).collect()
-                        ))
+                        tcx.mk_tup(
+                            ops.iter().map(|op| op.ty(mir, tcx)),
+                            false
+                        )
                     }
                     AggregateKind::Adt(def, _, substs, _) => {
-                        Some(tcx.lookup_item_type(def.did).ty.subst(tcx, substs))
+                        tcx.type_of(def.did).subst(tcx, substs)
                     }
                     AggregateKind::Closure(did, substs) => {
-                        Some(tcx.mk_closure_from_closure_substs(did, substs))
+                        tcx.mk_closure_from_closure_substs(did, substs)
                     }
                 }
             }
-            &Rvalue::InlineAsm { .. } => None
         }
     }
 }
@@ -222,7 +227,7 @@ impl<'tcx> BinOp {
                 assert_eq!(lhs_ty, rhs_ty);
                 lhs_ty
             }
-            &BinOp::Shl | &BinOp::Shr => {
+            &BinOp::Shl | &BinOp::Shr | &BinOp::Offset => {
                 lhs_ty // lhs_ty can be != rhs_ty
             }
             &BinOp::Eq | &BinOp::Lt | &BinOp::Le |
@@ -265,7 +270,8 @@ impl BinOp {
             BinOp::Lt => hir::BinOp_::BiLt,
             BinOp::Gt => hir::BinOp_::BiGt,
             BinOp::Le => hir::BinOp_::BiLe,
-            BinOp::Ge => hir::BinOp_::BiGe
+            BinOp::Ge => hir::BinOp_::BiGe,
+            BinOp::Offset => unreachable!()
         }
     }
 }

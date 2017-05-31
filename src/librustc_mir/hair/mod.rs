@@ -14,9 +14,8 @@
 //! unit-tested and separated from the Rust source and compiler data
 //! structures.
 
-use rustc::mir::repr::{BinOp, BorrowKind, Field, Literal, Mutability, UnOp,
-    TypedConstVal};
-use rustc::middle::const_val::ConstVal;
+use rustc_const_math::ConstUsize;
+use rustc::mir::{BinOp, BorrowKind, Field, Literal, UnOp};
 use rustc::hir::def_id::DefId;
 use rustc::middle::region::CodeExtent;
 use rustc::ty::subst::Substs;
@@ -28,8 +27,11 @@ use self::cx::Cx;
 
 pub mod cx;
 
+pub use rustc_const_eval::pattern::{BindingMode, Pattern, PatternKind, FieldPattern};
+
 #[derive(Clone, Debug)]
 pub struct Block<'tcx> {
+    pub targeted_by_break: bool,
     pub extent: CodeExtent,
     pub span: Span,
     pub stmts: Vec<StmtRef<'tcx>>,
@@ -97,6 +99,9 @@ pub struct Expr<'tcx> {
     /// temporary; should be None only if in a constant context
     pub temp_lifetime: Option<CodeExtent>,
 
+    /// whether this temp lifetime was shrunk by #36082.
+    pub temp_lifetime_was_shrunk: bool,
+
     /// span of the expression in the source
     pub span: Span,
 
@@ -131,7 +136,8 @@ pub enum ExprKind<'tcx> {
         op: LogicalOp,
         lhs: ExprRef<'tcx>,
         rhs: ExprRef<'tcx>,
-    },
+    }, // NOT overloaded!
+       // LogicalOp is distinct from BinaryOp because of lazy evaluation of the operands.
     Unary {
         op: UnOp,
         arg: ExprRef<'tcx>,
@@ -146,6 +152,9 @@ pub enum ExprKind<'tcx> {
         source: ExprRef<'tcx>,
     },
     ReifyFnPointer {
+        source: ExprRef<'tcx>,
+    },
+    ClosureFnPointer {
         source: ExprRef<'tcx>,
     },
     UnsafeFnPointer {
@@ -196,31 +205,32 @@ pub enum ExprKind<'tcx> {
         id: DefId,
     },
     Borrow {
-        region: &'tcx Region,
+        region: Region<'tcx>,
         borrow_kind: BorrowKind,
         arg: ExprRef<'tcx>,
     },
     Break {
-        label: Option<CodeExtent>,
+        label: CodeExtent,
+        value: Option<ExprRef<'tcx>>,
     },
     Continue {
-        label: Option<CodeExtent>,
+        label: CodeExtent,
     },
     Return {
         value: Option<ExprRef<'tcx>>,
     },
     Repeat {
         value: ExprRef<'tcx>,
-        count: TypedConstVal<'tcx>,
+        count: ConstUsize,
     },
-    Vec {
+    Array {
         fields: Vec<ExprRef<'tcx>>,
     },
     Tuple {
         fields: Vec<ExprRef<'tcx>>,
     },
     Adt {
-        adt_def: AdtDef<'tcx>,
+        adt_def: &'tcx AdtDef,
         variant_index: usize,
         substs: &'tcx Substs<'tcx>,
         fields: Vec<FieldExprRef<'tcx>>,
@@ -266,84 +276,10 @@ pub struct Arm<'tcx> {
     pub body: ExprRef<'tcx>,
 }
 
-#[derive(Clone, Debug)]
-pub struct Pattern<'tcx> {
-    pub ty: Ty<'tcx>,
-    pub span: Span,
-    pub kind: Box<PatternKind<'tcx>>,
-}
-
 #[derive(Copy, Clone, Debug)]
 pub enum LogicalOp {
     And,
     Or,
-}
-
-#[derive(Clone, Debug)]
-pub enum PatternKind<'tcx> {
-    Wild,
-
-    /// x, ref x, x @ P, etc
-    Binding {
-        mutability: Mutability,
-        name: ast::Name,
-        mode: BindingMode<'tcx>,
-        var: ast::NodeId,
-        ty: Ty<'tcx>,
-        subpattern: Option<Pattern<'tcx>>,
-    },
-
-    /// Foo(...) or Foo{...} or Foo, where `Foo` is a variant name from an adt with >1 variants
-    Variant {
-        adt_def: AdtDef<'tcx>,
-        variant_index: usize,
-        subpatterns: Vec<FieldPattern<'tcx>>,
-    },
-
-    /// (...), Foo(...), Foo{...}, or Foo, where `Foo` is a variant name from an adt with 1 variant
-    Leaf {
-        subpatterns: Vec<FieldPattern<'tcx>>,
-    },
-
-    /// box P, &P, &mut P, etc
-    Deref {
-        subpattern: Pattern<'tcx>,
-    },
-
-    Constant {
-        value: ConstVal,
-    },
-
-    Range {
-        lo: Literal<'tcx>,
-        hi: Literal<'tcx>,
-    },
-
-    /// matches against a slice, checking the length and extracting elements
-    Slice {
-        prefix: Vec<Pattern<'tcx>>,
-        slice: Option<Pattern<'tcx>>,
-        suffix: Vec<Pattern<'tcx>>,
-    },
-
-    /// fixed match against an array, irrefutable
-    Array {
-        prefix: Vec<Pattern<'tcx>>,
-        slice: Option<Pattern<'tcx>>,
-        suffix: Vec<Pattern<'tcx>>,
-    },
-}
-
-#[derive(Copy, Clone, Debug)]
-pub enum BindingMode<'tcx> {
-    ByValue,
-    ByRef(&'tcx Region, BorrowKind),
-}
-
-#[derive(Clone, Debug)]
-pub struct FieldPattern<'tcx> {
-    pub field: Field,
-    pub pattern: Pattern<'tcx>,
 }
 
 ///////////////////////////////////////////////////////////////////////////

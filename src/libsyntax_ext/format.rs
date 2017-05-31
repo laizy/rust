@@ -17,12 +17,13 @@ use syntax::ast;
 use syntax::ext::base::*;
 use syntax::ext::base;
 use syntax::ext::build::AstBuilder;
-use syntax::parse::token::{self, keywords};
+use syntax::parse::token;
 use syntax::ptr::P;
+use syntax::symbol::{Symbol, keywords};
 use syntax_pos::{Span, DUMMY_SP};
 use syntax::tokenstream;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::Entry;
 
 #[derive(PartialEq)]
@@ -369,7 +370,7 @@ impl<'a, 'b> Context<'a, 'b> {
     /// Translate the accumulated string literals to a literal expression
     fn trans_literal_string(&mut self) -> P<ast::Expr> {
         let sp = self.fmtsp;
-        let s = token::intern_and_get_ident(&self.literal);
+        let s = Symbol::intern(&self.literal);
         self.literal.clear();
         self.ecx.expr_str(sp, s)
     }
@@ -507,7 +508,7 @@ impl<'a, 'b> Context<'a, 'b> {
         let sp = piece_ty.span;
         let ty = ecx.ty_rptr(sp,
                              ecx.ty(sp, ast::TyKind::Slice(piece_ty)),
-                             Some(ecx.lifetime(sp, keywords::StaticLifetime.name())),
+                             Some(ecx.lifetime(sp, keywords::StaticLifetime.ident())),
                              ast::Mutability::Immutable);
         let slice = ecx.expr_vec_slice(sp, pieces);
         // static instead of const to speed up codegen by not requiring this to be inlined
@@ -535,7 +536,7 @@ impl<'a, 'b> Context<'a, 'b> {
 
         // First, build up the static array which will become our precompiled
         // format "string"
-        let static_lifetime = self.ecx.lifetime(self.fmtsp, keywords::StaticLifetime.name());
+        let static_lifetime = self.ecx.lifetime(self.fmtsp, keywords::StaticLifetime.ident());
         let piece_ty = self.ecx.ty_rptr(self.fmtsp,
                                         self.ecx.ty_ident(self.fmtsp, self.ecx.ident_of("str")),
                                         Some(static_lifetime),
@@ -558,11 +559,7 @@ impl<'a, 'b> Context<'a, 'b> {
             let name = self.ecx.ident_of(&format!("__arg{}", i));
             pats.push(self.ecx.pat_ident(DUMMY_SP, name));
             for ref arg_ty in self.arg_unique_types[i].iter() {
-                locals.push(Context::format_arg(self.ecx,
-                                                self.macsp,
-                                                e.span,
-                                                arg_ty,
-                                                self.ecx.expr_ident(e.span, name)));
+                locals.push(Context::format_arg(self.ecx, self.macsp, e.span, arg_ty, name));
             }
             heads.push(self.ecx.expr_addr_of(e.span, e));
         }
@@ -575,11 +572,7 @@ impl<'a, 'b> Context<'a, 'b> {
                 Exact(i) => spans_pos[i],
                 _ => panic!("should never happen"),
             };
-            counts.push(Context::format_arg(self.ecx,
-                                            self.macsp,
-                                            span,
-                                            &Count,
-                                            self.ecx.expr_ident(span, name)));
+            counts.push(Context::format_arg(self.ecx, self.macsp, span, &Count, name));
         }
 
         // Now create a vector containing all the arguments
@@ -640,10 +633,12 @@ impl<'a, 'b> Context<'a, 'b> {
 
     fn format_arg(ecx: &ExtCtxt,
                   macsp: Span,
-                  sp: Span,
+                  mut sp: Span,
                   ty: &ArgumentType,
-                  arg: P<ast::Expr>)
+                  arg: ast::Ident)
                   -> P<ast::Expr> {
+        sp.ctxt = sp.ctxt.apply_mark(ecx.current_expansion.mark);
+        let arg = ecx.expr_ident(sp, arg);
         let trait_ = match *ty {
             Placeholder(ref tyname) => {
                 match &tyname[..] {
@@ -727,7 +722,8 @@ pub fn expand_preparsed_format_args(ecx: &mut ExtCtxt,
         fmtsp: fmt.span,
     };
 
-    let mut parser = parse::Parser::new(&fmt.node.0);
+    let fmt_str = &*fmt.node.0.as_str();
+    let mut parser = parse::Parser::new(fmt_str);
     let mut pieces = vec![];
 
     loop {
@@ -756,8 +752,12 @@ pub fn expand_preparsed_format_args(ecx: &mut ExtCtxt,
     }
 
     if !parser.errors.is_empty() {
-        cx.ecx.span_err(cx.fmtsp,
-                        &format!("invalid format string: {}", parser.errors.remove(0)));
+        let (err, note) = parser.errors.remove(0);
+        let mut e = cx.ecx.struct_span_err(cx.fmtsp, &format!("invalid format string: {}", err));
+        if let Some(note) = note {
+            e.note(&note);
+        }
+        e.emit();
         return DummyResult::raw_expr(sp);
     }
     if !cx.literal.is_empty() {
@@ -767,6 +767,7 @@ pub fn expand_preparsed_format_args(ecx: &mut ExtCtxt,
 
     // Make sure that all arguments were used and all arguments have types.
     let num_pos_args = cx.args.len() - cx.names.len();
+    let mut errs = vec![];
     for (i, ty) in cx.arg_types.iter().enumerate() {
         if ty.len() == 0 {
             if cx.count_positions.contains_key(&i) {
@@ -779,8 +780,78 @@ pub fn expand_preparsed_format_args(ecx: &mut ExtCtxt,
                 // positional argument
                 "argument never used"
             };
-            cx.ecx.span_err(cx.args[i].span, msg);
+            errs.push((cx.args[i].span, msg));
         }
+    }
+    if errs.len() > 0 {
+        let args_used = cx.arg_types.len() - errs.len();
+        let args_unused = errs.len();
+
+        let mut diag = {
+            if errs.len() == 1 {
+                let (sp, msg) = errs.into_iter().next().unwrap();
+                cx.ecx.struct_span_err(sp, msg)
+            } else {
+                let mut diag = cx.ecx.struct_span_err(cx.fmtsp,
+                    "multiple unused formatting arguments");
+                for (sp, msg) in errs {
+                    diag.span_note(sp, msg);
+                }
+                diag
+            }
+        };
+
+        // Decide if we want to look for foreign formatting directives.
+        if args_used < args_unused {
+            use super::format_foreign as foreign;
+
+            // The set of foreign substitutions we've explained.  This prevents spamming the user
+            // with `%d should be written as {}` over and over again.
+            let mut explained = HashSet::new();
+
+            // Used to ensure we only report translations for *one* kind of foreign format.
+            let mut found_foreign = false;
+
+            macro_rules! check_foreign {
+                ($kind:ident) => {{
+                    let mut show_doc_note = false;
+
+                    for sub in foreign::$kind::iter_subs(fmt_str) {
+                        let trn = match sub.translate() {
+                            Some(trn) => trn,
+
+                            // If it has no translation, don't call it out specifically.
+                            None => continue,
+                        };
+
+                        let sub = String::from(sub.as_str());
+                        if explained.contains(&sub) {
+                            continue;
+                        }
+                        explained.insert(sub.clone());
+
+                        if !found_foreign {
+                            found_foreign = true;
+                            show_doc_note = true;
+                        }
+
+                        diag.help(&format!("`{}` should be written as `{}`", sub, trn));
+                    }
+
+                    if show_doc_note {
+                        diag.note(concat!(stringify!($kind), " formatting not supported; see \
+                                the documentation for `std::fmt`"));
+                    }
+                }};
+            }
+
+            check_foreign!(printf);
+            if !found_foreign {
+                check_foreign!(shell);
+            }
+        }
+
+        diag.emit();
     }
 
     cx.into_expr()
